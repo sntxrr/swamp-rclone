@@ -116,5 +116,7 @@ proves the packing is reversible).
 
 72 tests, and all 14 guards mutation-verified.
 
-**Not yet done:** live verification against the NAS, and the swamp workflow that
-sequences the ladder across shares on a schedule.
+**Not yet done:** live verification against the NAS. Nothing here has run
+against real hardware, so treat every rclone and DSM behaviour it relies on as
+asserted rather than observed. [`SETUP.md`](./SETUP.md) covers the AWS side and
+[`workflows/`](./workflows/) has a scheduling template.
