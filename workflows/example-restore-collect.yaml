@@ -1,0 +1,108 @@
+# Example workflow — collect a retrieval requested 48 hours earlier.
+#
+# NOT deployed from this repo. See example-restore-drill.yaml for why this is
+# a separate workflow rather than a second job in that one.
+id: 00000000-0000-0000-0000-000000000002
+name: archive-example-share-collect
+description: >-
+  Collect the retrieval that example-share-drill requested, download the
+  object, and verify its hash against the source.
+
+  Safe to run when there is nothing to collect. A pending retrieval is recorded
+  as phase "pending" with a failureReason of "still-retrieving", not as an
+  error -- Deep Archive returns InvalidObjectState until the copy is ready, and
+  treating that as a failure would alarm on the normal case.
+tags: {}
+# Two days after the request, same monthly cadence. Bulk retrieval is quoted at
+# up to 48 hours, so 72 gives margin without the schedule drifting into the
+# next month's request.
+trigger:
+  schedule: "0 4 4 * *"
+inputs:
+  properties:
+    objectPath:
+      type: string
+      description: Key requested by the drill workflow.
+    member:
+      type: string
+      description: >-
+        Packed shares only. Extract and hash this member rather than the pack.
+      default: ""
+    sourceSha256:
+      type: string
+      description: >-
+        Expected hash. A drill without it proves delivery, not correctness.
+      default: ""
+  required:
+    - objectPath
+jobs:
+  - name: collect
+    description: Download and hash the retrieved object
+    steps:
+      - name: restore-drill
+        description: >-
+          Rung 5. Streams the object -- or one member of it -- and hashes it
+          without landing anything on disk.
+
+          The byte ceiling is checked BEFORE any data moves, so an accidental
+          drill against a 400 GB pack fails cheaply rather than billing egress
+          to discover the object was large.
+        task:
+          type: model_method
+          modelIdOrName: archive-example-share
+          methodName: restoreDrill
+          inputs:
+            objectPath: ${{ inputs.objectPath }}
+            member: ${{ inputs.member }}
+            sourceSha256: ${{ inputs.sourceSha256 }}
+        dependsOn: []
+        weight: 0
+        # A drill that cannot complete yet is information, not an outage. The
+        # notify step below distinguishes the two.
+        allowFailure: true
+    dependsOn: []
+    weight: 0
+
+  - name: alert
+    description: Notify on a failed drill — and on a drill that has never passed
+    steps:
+      - name: notify-drill
+        description: >-
+          Fires on a genuine drill failure: content mismatch, or an object that
+          did not come back at all. Does NOT fire on "still-retrieving", which
+          is the expected state if the retrieval ran slow.
+
+          CONSTRAINT: the retrieval resource instance is
+          `<shareName>-<objectPath with / rewritten to ->`, so the expression
+          below is only correct for a slash-free objectPath. Drill a key at the
+          share root (`don.tar`), not a nested one (`homes/don.tar`) -- the
+          latter yields instance `...-homes-don.tar` while this expression
+          builds `...-homes/don.tar`, and the mismatch surfaces as an
+          expression error rather than as a missed alert.
+
+          A content mismatch is the most serious signal this whole suite can
+          produce. Everything else says the archive is present; this says it is
+          present and WRONG, which is worse than absent, because an absent
+          backup is at least not trusted.
+        task:
+          type: model_method
+          modelIdOrName: apprise-serve
+          methodName: notify
+          inputs:
+            title: 'Glacier archive: restore drill FAILED'
+            body: >-
+              ${{ 'Drill on ' +
+              data.latest('archive-example-share', 'example-share-' + inputs.objectPath).attributes.objectPath +
+              ' failed: ' +
+              string(data.latest('archive-example-share', 'example-share-' + inputs.objectPath).attributes.failureReason) +
+              '. A content mismatch means the archived copy is wrong, not missing.' }}
+            type: failure
+            format: markdown
+            when: >-
+              ${{ !data.latest('archive-example-share', 'example-share-' + inputs.objectPath).attributes.passed &&
+              data.latest('archive-example-share', 'example-share-' + inputs.objectPath).attributes.failureReason != 'still-retrieving' }}
+        dependsOn: []
+        weight: 0
+    dependsOn:
+      - collect
+    weight: 0

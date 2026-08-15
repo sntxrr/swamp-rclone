@@ -26,7 +26,7 @@ description: >-
   The restore rungs are absent on purpose. `restoreRequest` spends money and
   `restoreDrill` cannot complete for 12-48 hours after it, so they do not
   belong in the same DAG as the thing that writes. Drill on a separate, slower
-  schedule -- see the sibling example.
+  schedule -- see example-restore-drill.yaml and example-restore-collect.yaml.
 tags: {}
 # Weekly. The cadence is set by how fast the data changes, not by how fast the
 # archive could ingest: a share that churns a few percent a month gains
