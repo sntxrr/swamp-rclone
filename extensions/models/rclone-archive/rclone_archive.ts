@@ -366,7 +366,15 @@ const STANDARD_GB_MONTH = 0.023;
 const BULK_RETRIEVAL_GB = 0.0025;
 /** USD per GB, internet egress. */
 const EGRESS_GB = 0.09;
-/** USD per PUT request. */
+/**
+ * USD per PUT request.
+ *
+ * The AWS pricing API lists $0.03/1000 for PutObject to Glacier classes and
+ * $0.05/1000 for lifecycle transitions into Deep Archive. This suite writes
+ * the class directly rather than transitioning, so $0.03 is the likelier rate —
+ * the higher figure is kept deliberately, because a cost projection that
+ * surprises on the low side is the one that causes trouble.
+ */
 const PUT_REQUEST = 0.05 / 1000;
 
 /**
@@ -375,6 +383,15 @@ const PUT_REQUEST = 0.05 / 1000;
  * Retrieval is reported alongside storage deliberately. Storage is cheap enough
  * to be invisible; egress is not, and an archive whose recovery cost is only
  * discovered during a recovery is an archive nobody can afford to use.
+ *
+ * Under `pack` the object count is an UPPER BOUND, not a prediction. It assumes
+ * packs of `packTargetBytes`, whereas `push` actually emits one pack per
+ * top-level entry — usually far fewer, larger objects. Computing the real
+ * figure would need a second full tree walk at scan time, and the difference is
+ * worth a fraction of a cent a month, so the bound is deliberately left loose
+ * and labelled rather than paid for.
+ *
+ * Rates are us-west-2, verified against the AWS pricing API on 2026-08-15.
  */
 export function projectCost(
   count: number,
@@ -602,7 +619,11 @@ const InventorySchema = z.object({
   strategy: z.enum(["direct", "pack"]),
   strategyReason: z.string(),
 
-  /** Objects this share will occupy at the destination under `strategy`. */
+  /**
+   * Objects this share will occupy at the destination. Exact under `direct`
+   * (one per file); an UPPER BOUND under `pack`, where push emits one pack per
+   * top-level entry rather than one per packTargetBytes.
+   */
   projectedObjectCount: z.number(),
   storageUsdPerMonth: z.number(),
   overheadUsdPerMonth: z.number(),
