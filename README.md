@@ -114,7 +114,7 @@ Complete: `scan`, `push` (direct **and** pack), `verify`, `restoreRequest` and
 `restoreDrill` (including single-member extraction from a pack, which is what
 proves the packing is reversible).
 
-71 tests, and all 13 guards mutation-verified.
+72 tests, and all 14 guards mutation-verified.
 
 **Not yet done:** live verification against the NAS, and the swamp workflow that
 sequences the ladder across shares on a schedule.

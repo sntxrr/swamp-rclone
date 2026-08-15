@@ -775,7 +775,13 @@ type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
 const ScanArgsSchema = z.object({
   previousBytes: z.number().optional().describe(
     "Byte total from the previous scan, for churn measurement. Wire it in a " +
-      'workflow: ${{ data.latest("<model>", "inventory").attributes.totalBytes }}',
+      "workflow with data.latest(<model>, <RESOURCE INSTANCE>) — the second " +
+      "argument is the instance name, which here is the shareName, NOT the " +
+      "spec name 'inventory'. Passing the spec name fails during expression " +
+      "evaluation before any work runs, and allowFailure would then report " +
+      "the run as succeeded. Example for a model named archive-homes " +
+      "covering share homes: " +
+      "${{ data.latest('archive-homes', 'homes').attributes.totalBytes }}",
   ),
 });
 
@@ -936,26 +942,30 @@ async function pushPacked(
   );
 
   if (duRun.code !== RCLONE_EXIT.OK && plan.length === 0) {
-    const handle = await context.writeResource("transfer", share, {
-      shareName: share,
-      destination: dest,
-      strategy: "pack",
-      dryRun,
-      passed: false,
-      inconclusive: isInconclusive(duRun),
-      nothingToTransfer: false,
-      failureReason: classifyFailure(duRun),
-      detail: duRun.stderr.slice(0, 2000) || null,
-      exitCode: duRun.code,
-      storageClass,
-      packsPlanned: 0,
-      packsUploaded: 0,
-      packsSkipped: 0,
-      packsFailed: 0,
-      failedPacks: [],
-      ranAt: new Date().toISOString(),
-      durationMs: Date.now() - started,
-    });
+    const handle = await context.writeResource(
+      "transfer",
+      `${share}-transfer`,
+      {
+        shareName: share,
+        destination: dest,
+        strategy: "pack",
+        dryRun,
+        passed: false,
+        inconclusive: isInconclusive(duRun),
+        nothingToTransfer: false,
+        failureReason: classifyFailure(duRun),
+        detail: duRun.stderr.slice(0, 2000) || null,
+        exitCode: duRun.code,
+        storageClass,
+        packsPlanned: 0,
+        packsUploaded: 0,
+        packsSkipped: 0,
+        packsFailed: 0,
+        failedPacks: [],
+        ranAt: new Date().toISOString(),
+        durationMs: Date.now() - started,
+      },
+    );
     return { dataHandles: [handle] };
   }
 
@@ -1009,7 +1019,7 @@ async function pushPacked(
   }
 
   const passed = failed.length === 0;
-  const handle = await context.writeResource("transfer", share, {
+  const handle = await context.writeResource("transfer", `${share}-transfer`, {
     shareName: share,
     destination: dest,
     strategy: "pack",
@@ -1353,26 +1363,30 @@ export const model = {
           );
         }
 
-        const handle = await context.writeResource("transfer", share, {
-          shareName: share,
-          destination: dest,
-          strategy,
-          dryRun,
-          passed,
-          inconclusive,
-          nothingToTransfer: nothing,
-          failureReason: passed ? null : classifyFailure(run),
-          detail: run.stderr.slice(0, 2000) || null,
-          exitCode: run.code,
-          storageClass,
-          packsPlanned: 0,
-          packsUploaded: 0,
-          packsSkipped: 0,
-          packsFailed: 0,
-          failedPacks: [],
-          ranAt: new Date().toISOString(),
-          durationMs: Date.now() - started,
-        });
+        const handle = await context.writeResource(
+          "transfer",
+          `${share}-transfer`,
+          {
+            shareName: share,
+            destination: dest,
+            strategy,
+            dryRun,
+            passed,
+            inconclusive,
+            nothingToTransfer: nothing,
+            failureReason: passed ? null : classifyFailure(run),
+            detail: run.stderr.slice(0, 2000) || null,
+            exitCode: run.code,
+            storageClass,
+            packsPlanned: 0,
+            packsUploaded: 0,
+            packsSkipped: 0,
+            packsFailed: 0,
+            failedPacks: [],
+            ranAt: new Date().toISOString(),
+            durationMs: Date.now() - started,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -1417,24 +1431,29 @@ export const model = {
           isInconclusive(destRun);
 
         if (src === null || dst === null) {
-          const handle = await context.writeResource("verification", share, {
-            shareName: share,
-            destination: dest,
-            passed: false,
-            inconclusive,
-            failureReason: classifyFailure(worst),
-            detail: (destRun.stderr || sourceRun.stderr).slice(0, 2000) || null,
-            exitCode: worst.code,
-            sourceCount: src?.count ?? 0,
-            sourceBytes: src?.bytes ?? 0,
-            destCount: dst?.count ?? 0,
-            destBytes: dst?.bytes ?? 0,
-            countDelta: 0,
-            bytesDelta: 0,
-            contentVerified: false,
-            ranAt: new Date().toISOString(),
-            durationMs: Date.now() - started,
-          });
+          const handle = await context.writeResource(
+            "verification",
+            `${share}-verification`,
+            {
+              shareName: share,
+              destination: dest,
+              passed: false,
+              inconclusive,
+              failureReason: classifyFailure(worst),
+              detail: (destRun.stderr || sourceRun.stderr).slice(0, 2000) ||
+                null,
+              exitCode: worst.code,
+              sourceCount: src?.count ?? 0,
+              sourceBytes: src?.bytes ?? 0,
+              destCount: dst?.count ?? 0,
+              destBytes: dst?.bytes ?? 0,
+              countDelta: 0,
+              bytesDelta: 0,
+              contentVerified: false,
+              ranAt: new Date().toISOString(),
+              durationMs: Date.now() - started,
+            },
+          );
           return { dataHandles: [handle] };
         }
 
@@ -1445,27 +1464,31 @@ export const model = {
         const bytesDelta = dst.bytes - src.bytes;
         const passed = bytesDelta >= 0 && dst.bytes > 0;
 
-        const handle = await context.writeResource("verification", share, {
-          shareName: share,
-          destination: dest,
-          passed,
-          inconclusive,
-          failureReason: passed ? null : "destination-short",
-          detail: passed
-            ? null
-            : `destination holds ${dst.bytes} bytes against ${src.bytes} at ` +
-              `source (${bytesDelta})`,
-          exitCode: destRun.code,
-          sourceCount: src.count,
-          sourceBytes: src.bytes,
-          destCount: dst.count,
-          destBytes: dst.bytes,
-          countDelta,
-          bytesDelta,
-          contentVerified: false,
-          ranAt: new Date().toISOString(),
-          durationMs: Date.now() - started,
-        });
+        const handle = await context.writeResource(
+          "verification",
+          `${share}-verification`,
+          {
+            shareName: share,
+            destination: dest,
+            passed,
+            inconclusive,
+            failureReason: passed ? null : "destination-short",
+            detail: passed
+              ? null
+              : `destination holds ${dst.bytes} bytes against ${src.bytes} at ` +
+                `source (${bytesDelta})`,
+            exitCode: destRun.code,
+            sourceCount: src.count,
+            sourceBytes: src.bytes,
+            destCount: dst.count,
+            destBytes: dst.bytes,
+            countDelta,
+            bytesDelta,
+            contentVerified: false,
+            ranAt: new Date().toISOString(),
+            durationMs: Date.now() - started,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },

@@ -929,3 +929,23 @@ Deno.test("every resource spec has a schema and the methods write only those", (
   assertEquals(specs.has("retrieval"), true);
   assertEquals(Object.keys(model.methods).length, 5);
 });
+
+Deno.test("each spec writes a DISTINCT instance name", async () => {
+  // data.latest(model, name) resolves by resource INSTANCE name, not by spec.
+  // If scan, push and verify all wrote instance "homes", a workflow could not
+  // say which resource it meant — and the failure would be an expression
+  // evaluation error a few milliseconds in, which allowFailure would then
+  // report as a successful run.
+  const ssh = await fakeSsh(`echo '{"count":5,"bytes":5000}'`);
+  const { written, context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.scan.execute({}, context);
+    await model.methods.push.execute({}, context);
+    await model.methods.verify.execute({}, context);
+    const names = written.map((w) => w.instance);
+    assertEquals(names.length, new Set(names).size, `collided: ${names}`);
+    assertEquals(names, ["homes", "homes-transfer", "homes-verification"]);
+  } finally {
+    ssh.cleanup();
+  }
+});

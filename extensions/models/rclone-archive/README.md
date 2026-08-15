@@ -138,16 +138,17 @@ stream — a green drill for data that is not there.
 ~/.swamp/deno/deno test --allow-all extensions/models/rclone-archive/rclone_archive_test.ts
 ```
 
-71 tests. The suite mocks the `ssh` boundary only — `shQuote`, the remote
+72 tests. The suite mocks the `ssh` boundary only — `shQuote`, the remote
 command line, storage-class injection, env-file assembly and all parsing
 execute for real, because `shQuote` is the most security-relevant function here
 and stubbing it would test nothing.
 
-All 13 guards are mutation-verified — each is deleted in turn and the suite must
+All 14 guards are mutation-verified — each is deleted in turn and the suite must
 fail: `shQuote`, the forbidden-subcommand set, storage-class injection, the
 shell-entrypoint storage-class assertion, the credentials-based exemption for
 source-only calls, the argv secret scan, the env-file newline rejection, the
 restore byte ceiling, `pipefail` in both the pack and extract scripts, the
-skip-existing pack guard, and pack-plan determinism.
+skip-existing pack guard, pack-plan determinism, and per-spec instance-name
+distinctness.
 
 A green suite proves nothing until a mutation is shown to break it.
