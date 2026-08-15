@@ -20,6 +20,10 @@ import {
   projectCost,
   buildPackPlan,
   buildPackScript,
+  planPackUpload,
+  PACK_PART_BUDGET,
+  S3_DEFAULT_CHUNK_BYTES,
+  S3_MAX_UPLOAD_PARTS,
   buildExtractScript,
   RCLONE_EXIT,
   type RcloneResult,
@@ -593,8 +597,20 @@ Deno.test("no _root pack is created when the share root has no loose files", () 
   assertEquals(buildPackPlan([{ name: "homes", bytes: 5 }], 0).length, 1);
 });
 
+/** A streamable plan for a small pack, for tests that do not care about size. */
+function smallUpload() {
+  const plan = planPackUpload(1024);
+  if (!plan.streamable) throw new Error("fixture should be streamable");
+  return plan;
+}
+
 Deno.test("the pack script sets pipefail — without it a broken tar uploads truncated", () => {
-  const script = buildPackScript("homes", "dest:b/x/homes.tar", "DEEP_ARCHIVE");
+  const script = buildPackScript(
+    "homes",
+    "dest:b/x/homes.tar",
+    "DEEP_ARCHIVE",
+    smallUpload(),
+  );
   assertStringIncludes(script, "set -o pipefail");
   // Without pipefail the exit status is rclone's alone, so a tar that dies
   // halfway still exits 0 and the truncated stream is stored as complete.
@@ -604,8 +620,79 @@ Deno.test("the pack script sets pipefail — without it a broken tar uploads tru
 });
 
 Deno.test("the pack script quotes a member name containing a space", () => {
-  const script = buildPackScript("Resilio Sync", "dest:b/x/a.tar", "GLACIER");
+  const script = buildPackScript(
+    "Resilio Sync",
+    "dest:b/x/a.tar",
+    "GLACIER",
+    smallUpload(),
+  );
   assertStringIncludes(script, `'Resilio Sync'`);
+});
+
+Deno.test("the pack script names a chunk size — a streamed tar never auto-scales", () => {
+  // rclone only grows the chunk size for a file whose size it knows. A pack
+  // arrives on stdin, so without an explicit --s3-chunk-size it uses 5 MiB and
+  // dies at 10 000 parts = 48 GiB.
+  const script = buildPackScript(
+    "homes",
+    "dest:b/x/homes.tar",
+    "DEEP_ARCHIVE",
+    smallUpload(),
+  );
+  assertStringIncludes(script, "--s3-chunk-size");
+  assertStringIncludes(script, "--s3-upload-concurrency");
+});
+
+Deno.test("a pack inside the default chunk's reach is left at rclone's default", () => {
+  // The part budget, not the 10 000-part limit, sets where scaling begins:
+  // 8 000 x 5 MiB = 39.06 GiB.
+  const plan = planPackUpload(30 * 1024 ** 3);
+  assertEquals(plan.streamable, true);
+  if (plan.streamable) assertEquals(plan.chunkBytes, S3_DEFAULT_CHUNK_BYTES);
+});
+
+Deno.test("a pack just past the default chunk's reach scales up", () => {
+  const justOver = planPackUpload(40 * 1024 ** 3);
+  assertEquals(justOver.streamable, true);
+  if (justOver.streamable) {
+    assertEquals(justOver.chunkBytes > S3_DEFAULT_CHUNK_BYTES, true);
+  }
+});
+
+Deno.test("the 912 GiB Time Machine sparsebundle gets a chunk size that fits in 10 000 parts", () => {
+  // The regression this guard exists for. At the default 5 MiB chunk this pack
+  // needs 186 778 parts and dies ~48 GiB in.
+  const bytes = 912 * 1024 ** 3;
+  const plan = planPackUpload(bytes);
+  assertEquals(plan.streamable, true);
+  if (!plan.streamable) return;
+  assertEquals(Math.ceil(bytes / plan.chunkBytes) <= S3_MAX_UPLOAD_PARTS, true);
+  // And with 20% of the part budget still unspent, for tar's overhead.
+  assertEquals(Math.ceil(bytes / plan.chunkBytes) <= PACK_PART_BUDGET, true);
+});
+
+Deno.test("concurrency is spent before a pack is refused", () => {
+  // A 2 TiB pack needs a 256 MiB chunk. Four in flight is 1 GiB, which fits a
+  // 1 GiB budget exactly; a 300 MiB budget must buy the pack by dropping to
+  // one in-flight chunk rather than refusing it.
+  const bytes = 2 * 1024 ** 4;
+  const tight = planPackUpload(bytes, 300 * 1024 * 1024);
+  assertEquals(tight.streamable, true);
+  if (tight.streamable) assertEquals(tight.uploadConcurrency, 1);
+});
+
+Deno.test("a pack whose single chunk exceeds the memory budget is refused at plan time", () => {
+  // Refused BEFORE any bytes move — the alternative is discovering it at part
+  // 10 000, terabytes into a multipart upload that can never complete.
+  const plan = planPackUpload(4 * 1024 ** 4, 64 * 1024 * 1024);
+  assertEquals(plan.streamable, false);
+  if (!plan.streamable) assertStringIncludes(plan.reason, "memory budget");
+});
+
+Deno.test("a pack above S3's 5 TiB single-object limit is refused whatever the budget", () => {
+  const plan = planPackUpload(6 * 1024 ** 4, 1024 ** 4);
+  assertEquals(plan.streamable, false);
+  if (!plan.streamable) assertStringIncludes(plan.reason, "5 TiB");
 });
 
 Deno.test("a shell-entrypoint write without the storage class is refused", async () => {
