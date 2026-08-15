@@ -89,6 +89,69 @@ export function shQuote(word: string): string {
 }
 
 /**
+ * Sentinel standing in for the env-file path inside the docker argv.
+ *
+ * It is the single word that must NOT be shQuoted: it has to reach the remote
+ * shell as a live `"$ENVF"` expansion. Quoting it would pass the literal text
+ * `$ENVF` to docker, which would then fail to find that file and run rclone
+ * with no credentials at all.
+ *
+ * NUL bytes cannot occur in a real argv word, so this can never collide with
+ * a caller-supplied argument.
+ */
+export const ENV_FIFO_REF = "\u0000ENV_FIFO\u0000";
+
+/**
+ * Wrap the docker argv in the remote shell plumbing that delivers the env file.
+ *
+ * Credentials cannot be passed as `--env-file /dev/stdin`: DSM refuses to
+ * *open* that path (EACCES) even though fd 0 is an ordinary pipe owned by the
+ * SSH user, so docker exits 125 before rclone ever starts. Reading fd 0
+ * directly still works — only opening the path is denied.
+ *
+ * So the remote shell creates a FIFO inside a private 0700 directory and
+ * streams the env file through it. A FIFO has no on-disk contents — the bytes
+ * live in a kernel buffer, readable only by this user — so the credential
+ * still never lands on the NAS filesystem, and still never appears in argv on
+ * either host.
+ */
+export function buildRemoteCommand(dockerWords: string[]): string {
+  const refs = dockerWords.filter((w) => w === ENV_FIFO_REF).length;
+  if (refs !== 1) {
+    throw new Error(
+      `refusing to run: the env-file sentinel must appear exactly once in ` +
+        `the docker argv, found ${refs}`,
+    );
+  }
+
+  const docker = dockerWords
+    .map((w) => (w === ENV_FIFO_REF ? `"$ENVF"` : shQuote(w)))
+    .join(" ");
+
+  return [
+    // Preserve the real stdin on fd 3. A backgrounded command in a POSIX shell
+    // has its stdin redirected from /dev/null, so `cat` would otherwise deliver
+    // an EMPTY env file — and rclone would run with no credentials while every
+    // exit code still looked normal.
+    "exec 3<&0",
+    // An explicit template rather than a bare `mktemp -d`: BSD mktemp requires
+    // one, and keeping this portable means the shell logic below can be
+    // executed for real in the test suite instead of only asserted as text.
+    'D=$(mktemp -d "${TMPDIR:-/tmp}/rclone.XXXXXX") || exit 125',
+    `trap 'rm -rf "$D"' EXIT INT TERM`,
+    'ENVF="$D/env"',
+    'mkfifo -m 600 "$ENVF" || exit 125',
+    'cat <&3 > "$ENVF" & CATPID=$!',
+    `${docker}; rc=$?`,
+    // Never `wait` on the writer. If docker died before opening the FIFO — a
+    // bad flag, a missing image — `cat` is still blocked in open() and waiting
+    // would hang the run until the six-hour timeout.
+    'kill "$CATPID" 2>/dev/null',
+    "exit $rc",
+  ].join("; ");
+}
+
+/**
  * Build the docker env-file body that carries credentials to the remote.
  *
  * docker's --env-file is deliberately dumb: it splits on the first `=`, does
@@ -140,7 +203,8 @@ export function buildEnvFile(
  *  - Destructive subcommands are refused. `sync` against a source that failed
  *    to mount empties the destination, unrecoverably and still billed.
  *  - Secrets never reach argv on EITHER host. They travel as an env-file
- *    delivered on the SSH stdin pipe.
+ *    streamed down the SSH stdin pipe and into a FIFO on the remote, so they
+ *    also never land on the NAS filesystem. See buildRemoteCommand.
  *  - The storage class is injected. Without it the upload silently lands at S3
  *    Standard rates and nothing says so until the bill.
  */
@@ -208,19 +272,22 @@ export async function runRclone(
   }
 
   // The remote command line. Every word is quoted because ssh hands this to a
-  // login shell, and volume1 contains paths with spaces and parentheses.
-  const remote = [
+  // login shell, and volume1 contains paths with spaces and parentheses. The
+  // sole exception is ENV_FIFO_REF, which buildRemoteCommand turns into a live
+  // "$ENVF" expansion — see its comment for why the env file is a FIFO and not
+  // /dev/stdin.
+  const remote = buildRemoteCommand([
     transport.dockerBinary ?? "/usr/local/bin/docker",
     "run",
     "--rm",
     "--env-file",
-    "/dev/stdin",
+    ENV_FIFO_REF,
     "-v",
     `${transport.sourceMount}:/data:ro`,
     ...(transport.entrypoint ? ["--entrypoint", transport.entrypoint] : []),
     transport.image ?? "rclone/rclone:1.75.0",
     ...argv,
-  ].map(shQuote).join(" ");
+  ]);
 
   const controller = new AbortController();
   const timeoutMs = transport.timeoutMs ?? 6 * 60 * 60 * 1000;

@@ -26,6 +26,8 @@ import {
   redactSecrets,
   runRclone,
   shQuote,
+  buildRemoteCommand,
+  ENV_FIFO_REF,
 } from "./rclone_archive.ts";
 
 const CREDS = {
@@ -303,7 +305,7 @@ Deno.test("no credential reaches the remote command line", async () => {
     assert(!joined.includes(CREDS.accessKeyId));
     // ...but it does reach the container, via the stdin env-file.
     assertStringIncludes(ssh.stdin(), CREDS.secretAccessKey);
-    assertStringIncludes(ssh.argv().at(-1) ?? "", "--env-file' '/dev/stdin");
+    assertStringIncludes(ssh.argv().at(-1) ?? "", `'--env-file' "$ENVF"`);
   } finally {
     ssh.cleanup();
   }
@@ -1016,5 +1018,155 @@ Deno.test("each spec writes a DISTINCT instance name", async () => {
     assertEquals(names, ["homes", "homes-transfer", "homes-verification"]);
   } finally {
     ssh.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The env-file FIFO — DSM refuses to open /dev/stdin, so the env file is
+// streamed through a FIFO instead. See buildRemoteCommand.
+// ---------------------------------------------------------------------------
+
+Deno.test("the env-file path is the ONE word left unquoted, so it expands", () => {
+  const remote = buildRemoteCommand([
+    "/usr/local/bin/docker",
+    "run",
+    "--env-file",
+    ENV_FIFO_REF,
+    "rclone/rclone:1.75.0",
+  ]);
+  // Unquoted so the shell expands it...
+  assertStringIncludes(remote, `'--env-file' "$ENVF"`);
+  // ...and never as a literal, which docker would try to open as a filename.
+  assert(
+    !remote.includes(`'$ENVF'`),
+    "a quoted $ENVF would reach docker as a literal filename",
+  );
+  // Everything else still goes through shQuote.
+  assertStringIncludes(remote, `'rclone/rclone:1.75.0'`);
+});
+
+Deno.test("the sentinel must appear exactly once", () => {
+  for (
+    const words of [
+      ["/usr/local/bin/docker", "run", "img"],
+      ["/usr/local/bin/docker", ENV_FIFO_REF, ENV_FIFO_REF, "img"],
+    ]
+  ) {
+    let threw = false;
+    try {
+      buildRemoteCommand(words);
+    } catch (e) {
+      threw = true;
+      assertStringIncludes(String(e), "exactly once");
+    }
+    assert(threw, `expected a throw for ${words.length} words`);
+  }
+});
+
+Deno.test("the real stdin is preserved on fd 3", () => {
+  const remote = buildRemoteCommand(["docker", "--env-file", ENV_FIFO_REF]);
+  // A backgrounded command in a POSIX shell reads stdin from /dev/null. If the
+  // writer is not explicitly pointed at the saved fd, the env file arrives
+  // EMPTY and rclone runs with no credentials while exit codes look healthy.
+  assertStringIncludes(remote, "exec 3<&0");
+  assertStringIncludes(remote, 'cat <&3 > "$ENVF"');
+});
+
+Deno.test("the writer is killed, never waited on", () => {
+  const remote = buildRemoteCommand(["docker", "--env-file", ENV_FIFO_REF]);
+  // If docker dies before opening the FIFO, the writer is still blocked in
+  // open(). Waiting on it would hang the run until the six-hour timeout.
+  assert(
+    !/\bwait\b/.test(remote),
+    "waiting on the FIFO writer deadlocks when docker fails early",
+  );
+  assertStringIncludes(remote, 'kill "$CATPID"');
+});
+
+Deno.test("the FIFO is private and removed on every exit path", () => {
+  const remote = buildRemoteCommand(["docker", "--env-file", ENV_FIFO_REF]);
+  assertStringIncludes(remote, "mkfifo -m 600");
+  assertStringIncludes(remote, `trap 'rm -rf "$D"' EXIT INT TERM`);
+});
+
+Deno.test("the remote shell really delivers the env file, and propagates the exit code", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "rclone-fifo-" });
+  try {
+    const docker = `${dir}/docker`;
+    const seen = `${dir}/seen`;
+    // A stand-in for docker that copies out whatever --env-file pointed at,
+    // then exits non-zero so exit-code propagation is proven too.
+    await Deno.writeTextFile(
+      docker,
+      `#!/bin/sh
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--env-file" ]; then shift; cat "$1" > ${seen}; fi
+  shift
+done
+exit 7
+`,
+    );
+    await Deno.chmod(docker, 0o755);
+
+    const remote = buildRemoteCommand([
+      docker,
+      "run",
+      "--env-file",
+      ENV_FIFO_REF,
+      "rclone/rclone:1.75.0",
+    ]);
+
+    const child = new Deno.Command("/bin/sh", {
+      args: ["-c", remote],
+      stdin: "piped",
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    const writer = child.stdin.getWriter();
+    await writer.write(
+      new TextEncoder().encode("RCLONE_CONFIG_DEST_SECRET_ACCESS_KEY=s3cr3t\n"),
+    );
+    await writer.close();
+    const output = await child.output();
+
+    assertEquals(output.code, 7, "docker's exit code must survive the wrapper");
+    assertEquals(
+      await Deno.readTextFile(seen),
+      "RCLONE_CONFIG_DEST_SECRET_ACCESS_KEY=s3cr3t\n",
+      "the env file must arrive intact through the FIFO",
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("docker failing before it opens the FIFO does not hang", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "rclone-fifo-" });
+  try {
+    const docker = `${dir}/docker`;
+    // Never reads --env-file at all — the writer stays blocked in open().
+    await Deno.writeTextFile(docker, "#!/bin/sh\nexit 125\n");
+    await Deno.chmod(docker, 0o755);
+
+    const remote = buildRemoteCommand([docker, "--env-file", ENV_FIFO_REF]);
+    const child = new Deno.Command("/bin/sh", {
+      args: ["-c", remote],
+      stdin: "piped",
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    const writer = child.stdin.getWriter();
+    await writer.write(new TextEncoder().encode("K=v\n"));
+    await writer.close();
+
+    const output = await Promise.race([
+      child.output(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("deadlocked")), 15_000)
+      ),
+    ]);
+    assertEquals(output.code, 125);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
   }
 });
