@@ -170,14 +170,21 @@ makes the drill slow enough to be easy to postpone forever.
 
 ## 7. Shares that are not DSM shared folders
 
-`/volume1` contains directories that are **not** DSM shared folders — on this
-NAS: `alps`, `installer-msi`, `drum-racks`, `stems-from-external`,
-`midi-from-external`, `als`, plus loose files sitting in the volume root.
+`/volume1` typically contains directories that are **not** DSM shared folders —
+working directories created over SSH, leftovers from migrations, and loose files
+sitting in the volume root.
 
 They do not appear in Storage Analyzer's share list, in `synoshare --enum`, or
 anywhere else that enumerates *shares*. A model-instance list generated from the
-DSM share list therefore misses them silently — roughly 17 GB here, and silence
-is the problem rather than the size.
+DSM share list therefore misses them silently. On the NAS this suite was built
+for that was six directories and roughly 17 GB — small, but silence is the
+problem rather than the size, and the next volume's number is not this one.
+
+Enumerate what is actually there before trusting any share list:
+
+```bash
+ssh <nas> 'ls /volume1 | grep -v "^@"'   # everything, shares or not
+```
 
 Either add instances for them explicitly, or add one instance covering
 `/volume1` itself with the real shares excluded. Do not assume the share list is

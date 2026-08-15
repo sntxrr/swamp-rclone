@@ -103,7 +103,7 @@ swamp model @sntxrr/rclone-archive method run push archive-homes \
 would make object names a function of the data: add a file, the grouping shifts,
 every pack is renamed, and the next push re-uploads the share while paying a
 fresh 180-day minimum on each replaced object. `homes` gives one pack per user,
-`time-machine` one per sparsebundle, `docker` one per container — which is also
+`mac-backups` one per sparsebundle, `docker` one per container — which is also
 the granularity you would actually want to restore at.
 
 Loose files in the share root are collected into a single `_root.tar` so they

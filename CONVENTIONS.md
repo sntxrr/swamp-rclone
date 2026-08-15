@@ -192,11 +192,11 @@ with spaces and hands the result to the remote user's login shell, which re-word
 and glob-expands it. Any argument containing a space, quote, `$`, `*` or `(`
 is silently mangled or interpreted.
 
-This is not a hypothetical on this box. volume1 contains, today:
+This is not hypothetical. A Synology volume routinely contains names like:
 
 ```
 /volume1/Resilio Sync                       ← space
-/volume1/twilight-tears(sntxrrs-...).mp3    ← parentheses
+/volume1/live-set(final mix).wav    ← parentheses
 ```
 
 A path with a space becomes two arguments; parentheses are a syntax error in

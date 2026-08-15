@@ -153,7 +153,7 @@ function result(over: Partial<RcloneResult> = {}): RcloneResult {
 }
 
 // ---------------------------------------------------------------------------
-// shQuote — the paths in these tests are real entries on volume1
+// shQuote — these shapes all occur on a real Synology volume
 // ---------------------------------------------------------------------------
 
 Deno.test("shQuote survives a path containing a space", () => {
@@ -162,8 +162,8 @@ Deno.test("shQuote survives a path containing a space", () => {
 
 Deno.test("shQuote survives parentheses, which are sh syntax errors bare", () => {
   assertEquals(
-    shQuote("/volume1/twilight-tears(mix).mp3"),
-    `'/volume1/twilight-tears(mix).mp3'`,
+    shQuote("/volume1/live-set(final mix).wav"),
+    `'/volume1/live-set(final mix).wav'`,
   );
 });
 
@@ -407,7 +407,7 @@ Deno.test("small mean file size chooses pack", () => {
 });
 
 Deno.test("large mean file size chooses direct", () => {
-  // plex-data: ~30k files averaging >100 MB.
+  // media-library: ~30k files averaging >100 MB.
   assertEquals(chooseStrategy(30_000, 3.76e12, 1024 * 1024), "direct");
 });
 
@@ -471,9 +471,9 @@ Deno.test("scan records an unreachable share instead of throwing", async () => {
 
 Deno.test("scan projects cost and raises a churn warning", async () => {
   const ssh = await fakeSsh(`echo '{"count":157000,"bytes":1260000000000}'`);
-  const { written, context } = testContext(baseArgs(ssh.path, { shareName: "time-machine" }));
+  const { written, context } = testContext(baseArgs(ssh.path, { shareName: "mac-backups" }));
   try {
-    // time-machine's sparsebundle bands: high churn against a 180-day minimum.
+    // sparsebundle bands: high churn against a 180-day minimum.
     await model.methods.scan.execute({ previousBytes: 1_000_000_000_000 }, context);
     const d = written[0].data as Record<string, number | boolean>;
     assertEquals(d.churnWarning, true);

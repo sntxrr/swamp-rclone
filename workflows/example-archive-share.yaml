@@ -9,7 +9,7 @@
 # them. The reason is the per-model lock: every step here targets the same
 # model instance, and a fan-out across shares would contend on that lock while
 # a multi-terabyte copy holds it for hours. Separate workflows also mean a
-# failing share does not block the others, which matters when `time-machine`
+# failing share does not block the others, which matters when `mac-backups`
 # is the one that fails.
 id: 00000000-0000-0000-0000-000000000000
 name: archive-example-share

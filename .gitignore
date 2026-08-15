@@ -16,8 +16,9 @@
 # Vault definitions. `swamp vault create --config` persists whatever it is
 # given verbatim, and marking a field `sensitive` governs logging, not what
 # lands on disk — so a literal key passed on the command line becomes a live
-# AWS credential in a tracked file. Never commit a vault definition; wire
-# secrets as vault references and keep the file out of git.
+# AWS credential in a tracked file. This repository is public. Never commit a
+# vault definition; wire secrets as vault references and keep the file out of
+# git.
 vaults/
 
 # Model definitions. Every instance is named after a real share on a real NAS

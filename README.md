@@ -15,7 +15,7 @@ The homelab backs up 18 Linux hosts nightly with restic into per-host Backblaze
 B2 buckets, and `@sntxrr/restic-repository` validates that they restore. Every
 host in the fleet is covered.
 
-Except the Synology. It holds **13.79 TB** and has no off-site copy at all — the
+Except the Synology. It holds **13.8 TB** and has no off-site copy at all — the
 largest store of data in the house is the only machine with nothing behind it.
 
 The evidence that this was noticed before and never finished is still on the
@@ -49,7 +49,7 @@ is no Entware on this box, and a hand-installed binary does not survive a DSM
 upgrade. A container does.
 
 **It reports the recovery cost, not just the storage cost.** Storage is cheap
-enough to be invisible — $13.65/mo for 13.79 TB. Egress for a full recovery is
+enough to be invisible — $13.65/mo for 13.8 TB. Egress for a full recovery is
 **$1 241**. An archive whose recovery cost is first discovered *during* a
 recovery is an archive nobody can afford to use, so `scan` records that number
 every time it runs.
