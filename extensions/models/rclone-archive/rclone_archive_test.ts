@@ -28,6 +28,9 @@ import {
   shQuote,
   buildRemoteCommand,
   ENV_FIFO_REF,
+  DEFAULT_STORAGE_CLASS,
+  S3_STORAGE_CLASSES,
+  ARCHIVE_STORAGE_CLASSES,
 } from "./rclone_archive.ts";
 
 const CREDS = {
@@ -38,7 +41,7 @@ const CREDS = {
 const DEST = {
   bucket: "example-archive-bucket",
   region: "us-west-2",
-  storageClass: "GLACIER_DEEP_ARCHIVE",
+  storageClass: "DEEP_ARCHIVE",
 };
 
 // ---------------------------------------------------------------------------
@@ -254,7 +257,7 @@ Deno.test("the storage class is injected when absent", async () => {
       sourceMount: "/volume1/homes",
     }, ["copy", "/data", "dest:bucket/x"]);
     const remote = ssh.argv().at(-1) ?? "";
-    assertStringIncludes(remote, `'--s3-storage-class' 'GLACIER_DEEP_ARCHIVE'`);
+    assertStringIncludes(remote, `'--s3-storage-class' 'DEEP_ARCHIVE'`);
   } finally {
     ssh.cleanup();
   }
@@ -326,7 +329,7 @@ Deno.test("buildEnvFile omits empty credentials entirely", () => {
   const body = buildEnvFile({ accessKeyId: "", secretAccessKey: "" }, DEST);
   assert(!body.includes("ACCESS_KEY_ID"));
   assert(!body.includes("SECRET_ACCESS_KEY"));
-  assertStringIncludes(body, "RCLONE_CONFIG_DEST_STORAGE_CLASS=GLACIER_DEEP_ARCHIVE");
+  assertStringIncludes(body, "RCLONE_CONFIG_DEST_STORAGE_CLASS=DEEP_ARCHIVE");
 });
 
 Deno.test("a source-only scan ships no credentials to the NAS", async () => {
@@ -587,7 +590,7 @@ Deno.test("no _root pack is created when the share root has no loose files", () 
 });
 
 Deno.test("the pack script sets pipefail — without it a broken tar uploads truncated", () => {
-  const script = buildPackScript("homes", "dest:b/x/homes.tar", "GLACIER_DEEP_ARCHIVE");
+  const script = buildPackScript("homes", "dest:b/x/homes.tar", "DEEP_ARCHIVE");
   assertStringIncludes(script, "set -o pipefail");
   // Without pipefail the exit status is rclone's alone, so a tar that dies
   // halfway still exits 0 and the truncated stream is stored as complete.
@@ -1169,4 +1172,50 @@ Deno.test("docker failing before it opens the FIFO does not hang", async () => {
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// The storage class must be one S3 actually accepts.
+//
+// GLACIER_DEEP_ARCHIVE was the default here, and sat in the check's own
+// allowlist, until a live run rejected all 37 objects with 400
+// InvalidStorageClass. The guard reported it as a valid archive tier because
+// it only ever compared against a hand-written list.
+// ---------------------------------------------------------------------------
+
+Deno.test("the default storage class is one S3 accepts", () => {
+  assertEquals(DEFAULT_STORAGE_CLASS, "DEEP_ARCHIVE");
+  assert(
+    S3_STORAGE_CLASSES.includes(DEFAULT_STORAGE_CLASS),
+    "the default must be a real S3 storage class",
+  );
+  assert(
+    ARCHIVE_STORAGE_CLASSES.includes(DEFAULT_STORAGE_CLASS),
+    "the default must be an archive tier",
+  );
+});
+
+Deno.test("GLACIER_DEEP_ARCHIVE is not a storage class and must be refused", async () => {
+  const r = await model.checks["archive-storage-class"].execute({
+    globalArgs: { storageClass: "GLACIER_DEEP_ARCHIVE" } as never,
+  });
+  assertEquals(r.pass, false);
+  // It must fail as INVALID, not as "not an archive tier" — the whole bug was
+  // that the two were conflated.
+  assertStringIncludes(String(r.errors), "InvalidStorageClass");
+  assertStringIncludes(String(r.errors), "does not exist");
+});
+
+Deno.test("every archive class is also a valid S3 class", () => {
+  for (const c of ARCHIVE_STORAGE_CLASSES) {
+    assert(S3_STORAGE_CLASSES.includes(c), `${c} is not a valid S3 class`);
+  }
+});
+
+Deno.test("a valid but non-archive class still fails, on cost grounds", async () => {
+  const r = await model.checks["archive-storage-class"].execute({
+    globalArgs: { storageClass: "STANDARD" } as never,
+  });
+  assertEquals(r.pass, false);
+  assertStringIncludes(String(r.errors), "23x");
 });

@@ -19,6 +19,49 @@ export const RCLONE_EXIT = {
   DURATION_LIMIT: 10,
 } as const;
 
+/**
+ * The storage class this suite exists to write.
+ *
+ * It is `DEEP_ARCHIVE`, NOT `GLACIER_DEEP_ARCHIVE`. The latter reads like the
+ * obvious name, appears in plenty of prose, and is not a storage class S3
+ * accepts: every PutObject carrying it fails with
+ * `400 InvalidStorageClass`. This was the default here until a live run
+ * against real hardware rejected all 37 objects.
+ *
+ * Defined once because it was previously repeated at five call sites, and a
+ * constant that must agree with itself in five places is a bug waiting for
+ * one of them to drift.
+ */
+export const DEFAULT_STORAGE_CLASS = "DEEP_ARCHIVE";
+
+/**
+ * Storage classes rclone accepts for the AWS provider.
+ *
+ * The check below validates membership in THIS set before asking whether the
+ * class is an archive tier. Those are different failures and were previously
+ * conflated: an invalid class fell through the "not an archive tier" branch,
+ * so a typo was reported as a cost problem — or, as with
+ * `GLACIER_DEEP_ARCHIVE`, sat in the allowlist and was reported as fine.
+ */
+export const S3_STORAGE_CLASSES = [
+  "DEFAULT",
+  "STANDARD",
+  "REDUCED_REDUNDANCY",
+  "STANDARD_IA",
+  "ONEZONE_IA",
+  "INTELLIGENT_TIERING",
+  "GLACIER",
+  "GLACIER_IR",
+  "DEEP_ARCHIVE",
+];
+
+/** The subset of the above that is actually an archive tier. */
+export const ARCHIVE_STORAGE_CLASSES = [
+  "GLACIER",
+  "GLACIER_IR",
+  "DEEP_ARCHIVE",
+];
+
 /** Subcommands that remove data. This suite never deletes. */
 const FORBIDDEN = new Set([
   "sync",
@@ -813,7 +856,8 @@ const GlobalArgsSchema = z.object({
     "AWS secret access key — supply via vault.get(), never inline.",
   ),
   storageClass: z.string().optional().describe(
-    "S3 storage class. Default GLACIER_DEEP_ARCHIVE. Changing this is a " +
+    "S3 storage class. Default DEEP_ARCHIVE — note that the plausible-looking " +
+      "GLACIER_DEEP_ARCHIVE is not a class S3 accepts. Changing this is a " +
       "cost decision: STANDARD is roughly 23x the price.",
   ),
   destPrefix: z.string().optional().describe(
@@ -965,7 +1009,7 @@ function destinationOf(g: GlobalArgs): RcloneDestination {
   return {
     bucket: g.bucket,
     region: g.region,
-    storageClass: g.storageClass ?? "GLACIER_DEEP_ARCHIVE",
+    storageClass: g.storageClass ?? DEFAULT_STORAGE_CLASS,
   };
 }
 
@@ -1025,7 +1069,7 @@ async function pushPacked(
   const dryRun = args.dryRun ?? false;
   const repack = args.repack ?? false;
   const dest = destPath(g.bucket, g.destPrefix ?? "", share);
-  const storageClass = g.storageClass ?? "GLACIER_DEEP_ARCHIVE";
+  const storageClass = g.storageClass ?? DEFAULT_STORAGE_CLASS;
   const creds = credentialsOf(g);
   const destination = destinationOf(g);
   const transport = transportOf(g);
@@ -1255,14 +1299,24 @@ export const model = {
       execute: async (
         context: { globalArgs: GlobalArgs },
       ): Promise<{ pass: boolean; errors?: string[] }> => {
-        const sc = context.globalArgs.storageClass ?? "GLACIER_DEEP_ARCHIVE";
-        const archive = [
-          "GLACIER",
-          "GLACIER_IR",
-          "DEEP_ARCHIVE",
-          "GLACIER_DEEP_ARCHIVE",
-        ];
-        if (!archive.includes(sc)) {
+        const sc = context.globalArgs.storageClass ?? DEFAULT_STORAGE_CLASS;
+        // An invalid class is a DIFFERENT failure from a valid-but-expensive
+        // one, and must be reported as such. Conflating them is how
+        // GLACIER_DEEP_ARCHIVE — which S3 rejects outright — sat in this
+        // allowlist being reported as a perfectly good archive tier.
+        if (!S3_STORAGE_CLASSES.includes(sc)) {
+          return {
+            pass: false,
+            errors: [
+              `storageClass "${sc}" is not a storage class S3 accepts, so ` +
+              `every PutObject will fail with 400 InvalidStorageClass. Valid ` +
+              `values are: ${S3_STORAGE_CLASSES.join(", ")}. Note that ` +
+              `"GLACIER_DEEP_ARCHIVE" is a plausible-looking name that does ` +
+              `not exist — Deep Archive is "DEEP_ARCHIVE".`,
+            ],
+          };
+        }
+        if (!ARCHIVE_STORAGE_CLASSES.includes(sc)) {
           return {
             pass: false,
             errors: [
@@ -1437,7 +1491,7 @@ export const model = {
         const strategy = args.strategy ??
           (g.strategy && g.strategy !== "auto" ? g.strategy : "direct");
         const dest = destPath(g.bucket, g.destPrefix ?? "", share);
-        const storageClass = g.storageClass ?? "GLACIER_DEEP_ARCHIVE";
+        const storageClass = g.storageClass ?? DEFAULT_STORAGE_CLASS;
 
         if (strategy === "pack") {
           return await pushPacked(args, context, started);
@@ -1778,7 +1832,7 @@ export const model = {
         // is hashed — the difference between "the object came back" and "the
         // archive can actually be opened", which is the whole point of a drill
         // against a packed share.
-        const storageClass = g.storageClass ?? "GLACIER_DEEP_ARCHIVE";
+        const storageClass = g.storageClass ?? DEFAULT_STORAGE_CLASS;
         const hashRun = args.member
           ? await runRclone(
             credentialsOf(g),

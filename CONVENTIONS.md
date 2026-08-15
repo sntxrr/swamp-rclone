@@ -139,7 +139,7 @@ outcome rather than an error.
 
 ### 4.2 The storage class must be injected, not trusted
 
-Uploading without `--s3-storage-class GLACIER_DEEP_ARCHIVE` silently writes at
+Uploading without `--s3-storage-class DEEP_ARCHIVE` silently writes at
 S3 Standard rates — **23× the cost** — and nothing in rclone's output says so.
 The mistake is invisible until a bill arrives a month later, and fixing it
 afterwards means re-uploading (and paying the minimum-duration charge on

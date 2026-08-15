@@ -95,7 +95,7 @@ aws s3api put-bucket-lifecycle-configuration \
 ```
 
 Note what this rule is **not**: there is no transition rule and no expiration
-rule. Objects are written *directly* as `GLACIER_DEEP_ARCHIVE` by rclone, so
+rule. Objects are written *directly* as `DEEP_ARCHIVE` by rclone, so
 transitioning them is unnecessary, and a lifecycle transition would additionally
 charge a per-object transition fee for a storage class they are already in.
 
