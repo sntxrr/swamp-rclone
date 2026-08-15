@@ -903,9 +903,14 @@ Deno.test("the archive-storage-class check rejects a non-archive tier", async ()
   });
   assertEquals(bad.pass, false);
   // The message must quantify the mistake, not merely name it — "wrong tier"
-  // is ignorable, "$317/mo instead of $14/mo" is not.
+  // is ignorable, "23x the price" is not. It must quantify it in RATES rather
+  // than in one deployment's bill: this extension is published, and a figure
+  // derived from the author's own volume is both a disclosure and meaningless
+  // to everyone else who installs it.
   assertStringIncludes(bad.errors?.[0] ?? "", "not an archive tier");
-  assertStringIncludes(bad.errors?.[0] ?? "", "$317/mo");
+  assertStringIncludes(bad.errors?.[0] ?? "", "23x");
+  assertStringIncludes(bad.errors?.[0] ?? "", "0.00099");
+  assert(!/\b13\.79\b/.test(bad.errors?.[0] ?? ""), "no volume-specific size");
 
   const good = await model.checks["archive-storage-class"].execute({
     globalArgs: {} as never,

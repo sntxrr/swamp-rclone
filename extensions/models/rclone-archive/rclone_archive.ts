@@ -1156,8 +1156,11 @@ export const model = {
             pass: false,
             errors: [
               `storageClass "${sc}" is not an archive tier. This suite exists ` +
-              `to write Deep Archive; at STANDARD rates 13.79 TB costs ` +
-              `~$317/mo instead of ~$14/mo. Set it deliberately or not at all.`,
+              `to write Deep Archive, and S3 Standard is roughly 23x the ` +
+              `price per GB-month ($0.023 against $0.00099) — on a ` +
+              `multi-terabyte volume that is the difference between tens of ` +
+              `dollars a month and hundreds. Nothing in rclone's output will ` +
+              `tell you which one you got. Set this deliberately or not at all.`,
             ],
           };
         }
