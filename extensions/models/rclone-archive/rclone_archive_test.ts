@@ -722,6 +722,70 @@ esac`,
   }
 });
 
+// ---------------------------------------------------------------------------
+// Cadence: --no-traverse is a cost trap without a window
+// ---------------------------------------------------------------------------
+
+Deno.test("a full push traverses rather than HEADing every file", async () => {
+  // Without a window, --no-traverse would issue one HEAD per source file —
+  // ~80x the cost of one destination listing, and ~$1,460/mo at hourly
+  // against ~$18/mo. So no window means no --no-traverse.
+  const ssh = await fakeSsh("exit 0");
+  const { context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.push.execute({}, context);
+    const remote = ssh.argv().at(-1) ?? "";
+    assert(
+      !remote.includes("--no-traverse"),
+      "--no-traverse must not appear without a --max-age window",
+    );
+    assert(!remote.includes("--max-age"));
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("a windowed push enables --no-traverse, and only then", async () => {
+  const ssh = await fakeSsh("exit 0");
+  const { context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.push.execute({ maxAgeMinutes: 120 }, context);
+    const remote = ssh.argv().at(-1) ?? "";
+    assertStringIncludes(remote, "'--max-age' '120m'");
+    assertStringIncludes(remote, "--no-traverse");
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("the window can be set on the model, not just per run", async () => {
+  const ssh = await fakeSsh("exit 0");
+  const { context } = testContext(baseArgs(ssh.path, { maxAgeMinutes: 90 }));
+  try {
+    await model.methods.push.execute({}, context);
+    assertStringIncludes(ssh.argv().at(-1) ?? "", "'--max-age' '90m'");
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("--immutable is on by default and removable only deliberately", async () => {
+  const ssh = await fakeSsh("exit 0");
+  const { context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.push.execute({}, context);
+    assertStringIncludes(ssh.argv().at(-1) ?? "", "--immutable");
+
+    await model.methods.push.execute({ allowOverwrite: true }, context);
+    assert(
+      !(ssh.argv().at(-1) ?? "").includes("--immutable"),
+      "allowOverwrite must drop --immutable",
+    );
+  } finally {
+    ssh.cleanup();
+  }
+});
+
 Deno.test("push marks a transfer cap inconclusive rather than failed", async () => {
   const ssh = await fakeSsh("exit 8");
   const { written, context } = testContext(baseArgs(ssh.path));

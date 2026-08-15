@@ -770,6 +770,22 @@ const GlobalArgsSchema = z.object({
   packTargetBytes: z.number().optional().describe(
     "Target size of one tar object when packing. Default 1 GiB.",
   ),
+  maxAgeMinutes: z.number().optional().describe(
+    "Only consider files modified within this many minutes. Unset means a " +
+      "FULL check, where rclone lists the destination once. Setting it " +
+      "enables --no-traverse, which is a cost trap without a window: it " +
+      "issues one HEAD per considered file, ~80x the cost of a single " +
+      "listing. Use a window comfortably wider than the schedule interval " +
+      "(e.g. 120 for hourly), and run a periodic FULL push with it unset to " +
+      "catch anything a missed or failed run skipped.",
+  ),
+  allowOverwrite: z.boolean().optional().describe(
+    "Drop --immutable, permitting modified files to be re-archived. Off by " +
+      "default: on Deep Archive an overwrite deletes the old object and " +
+      "still bills its remaining 180-day minimum, so updates cost roughly " +
+      "six months of storage per replaced byte. With it off, modified files " +
+      "are never updated and are reported as errors.",
+  ),
   minAgeMinutes: z.number().optional().describe(
     "Skip files modified more recently than this. Default 15 — the NAS is " +
       "live and Plex, ABB and Time Machine all write during a run.",
@@ -817,6 +833,13 @@ const PushArgsSchema = z.object({
   maxTransferBytes: z.number().optional().describe(
     "Stop after this many bytes (--max-transfer). Exit 8 is recorded as " +
       "inconclusive, not as a failure.",
+  ),
+  maxAgeMinutes: z.number().optional().describe(
+    "Override the modified-within window for this run. Omit on a periodic " +
+      "full reconciliation.",
+  ),
+  allowOverwrite: z.boolean().optional().describe(
+    "Permit re-archiving modified files for this run only.",
   ),
   repack: z.boolean().optional().describe(
     "Pack strategy only. Replace packs whose object already exists. Off by " +
@@ -1353,9 +1376,10 @@ export const model = {
           return await pushPacked(args, context, started);
         }
 
+        const maxAge = args.maxAgeMinutes ?? g.maxAgeMinutes;
+        const overwrite = args.allowOverwrite ?? g.allowOverwrite ?? false;
+
         const flags = [
-          "--immutable",
-          "--no-traverse",
           "--error-on-no-transfer",
           "--min-age",
           `${g.minAgeMinutes ?? 15}m`,
@@ -1363,6 +1387,28 @@ export const model = {
           "--stats",
           "5m",
         ];
+
+        // --immutable refuses to overwrite a changed file. That is the right
+        // default for an archive — on Deep Archive an overwrite deletes the
+        // old object and bills its remaining 180-day minimum anyway — but it
+        // means a MODIFIED file is never archived and reports as an error.
+        // Opting out is a cost decision, so it is explicit.
+        if (!overwrite) flags.push("--immutable");
+
+        // --no-traverse and --max-age are coupled deliberately, because
+        // --no-traverse alone is a cost trap.
+        //
+        // With it, rclone skips listing the destination and instead issues one
+        // HEAD per source file it CONSIDERS. That is a win only when few files
+        // are considered. Considering all of them costs ~80x more than a single
+        // destination listing: at 5M files that is ~$2.00 a run against ~$0.03,
+        // which at an hourly cadence is ~$1,460/mo against ~$18/mo.
+        //
+        // A --max-age window is what makes the candidate set small. So the
+        // window enables --no-traverse, and without a window rclone traverses.
+        if (maxAge !== undefined) {
+          flags.push("--max-age", `${maxAge}m`, "--no-traverse");
+        }
         if (dryRun) flags.push("--dry-run");
         if (args.maxTransferBytes) {
           flags.push("--max-transfer", String(args.maxTransferBytes));
