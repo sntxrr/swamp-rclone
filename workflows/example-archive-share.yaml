@@ -1,0 +1,164 @@
+# Example workflow — one share up the ladder, on a schedule.
+#
+# NOT deployed from this repo. This is a template: copy it into the
+# implementation repo (swamp-homelab), give it a fresh uuid, and point
+# modelIdOrName at a real instance. Extension repos stay public-shaped and
+# carry no real host, bucket or share names.
+#
+# One workflow per share rather than one workflow fanning out over all of
+# them. The reason is the per-model lock: every step here targets the same
+# model instance, and a fan-out across shares would contend on that lock while
+# a multi-terabyte copy holds it for hours. Separate workflows also mean a
+# failing share does not block the others, which matters when `mac-backups`
+# is the one that fails.
+id: 00000000-0000-0000-0000-000000000000
+name: archive-example-share
+description: >-
+  Scan, push and verify one Synology share into Glacier Deep Archive, then
+  notify only if something actually went wrong.
+
+  The ladder is deliberately not run end-to-end unattended. `scan` and `verify`
+  are free and safe on any cadence. `push` moves money: on Deep Archive every
+  object written is billed for a 180-day minimum whether or not you keep it,
+  so it runs on a schedule but behind a `maxTransferBytes` cap until the first
+  full pass is known good.
+
+  The restore rungs are absent on purpose. `restoreRequest` spends money and
+  `restoreDrill` cannot complete for 12-48 hours after it, so they do not
+  belong in the same DAG as the thing that writes. Drill on a separate, slower
+  schedule -- see example-restore-drill.yaml and example-restore-collect.yaml.
+tags: {}
+# Weekly. The cadence is set by how fast the data changes, not by how fast the
+# archive could ingest: a share that churns a few percent a month gains
+# nothing from a nightly push and pays a fresh 180-day minimum on every object
+# it replaces. `scan` reports churnFraction so this number can be revisited
+# with evidence rather than guessed twice.
+trigger:
+  schedule: "0 3 * * 0"
+inputs:
+  properties:
+    push:
+      type: boolean
+      description: >-
+        Actually upload. Set false to refresh the inventory and cost
+        projection without writing anything -- which is also the right way to
+        watch churn for a few weeks before committing a share to Glacier.
+      default: true
+    maxTransferBytes:
+      type: number
+      description: >-
+        Per-run byte cap. Exit 8 is recorded as inconclusive rather than as a
+        failure, so hitting the cap is a normal outcome, not an alarm.
+      default: 107374182400
+  required: []
+jobs:
+  - name: inventory
+    description: Measure the share and project what it costs to hold and to recover
+    steps:
+      - name: scan
+        description: >-
+          Rung 1. Writes an `inventory` resource named after the share.
+
+          previousBytes is wired from the PREVIOUS run's resource so churn is
+          measurable. Note the second argument to data.latest() is the resource
+          INSTANCE name -- here the shareName -- not the spec name
+          `inventory`. Passing the spec name fails during expression
+          evaluation in a few milliseconds, before any work happens, and with
+          allowFailure set that failure would be reported as success.
+
+          On the very first run there is no previous resource and this
+          expression yields nothing; churnFraction is then null, which is the
+          correct answer rather than an error.
+        task:
+          type: model_method
+          modelIdOrName: archive-example-share
+          methodName: scan
+          inputs:
+            previousBytes: >-
+              ${{ data.latest('archive-example-share', 'example-share').attributes.totalBytes }}
+        dependsOn: []
+        weight: 0
+    dependsOn: []
+    weight: 0
+
+  - name: transfer
+    description: Copy to Deep Archive, capped
+    steps:
+      - name: push
+        description: >-
+          Rung 2. Gated on the `push` input rather than a step condition,
+          because step conditions in swamp are status-based
+          (succeeded/failed/skipped) and cannot express a predicate over data.
+
+          dryRun is the inverse of the input: a run with push=false still
+          exercises the whole transport and reports what WOULD move, which is
+          strictly more useful than skipping the step.
+        task:
+          type: model_method
+          modelIdOrName: archive-example-share
+          methodName: push
+          inputs:
+            dryRun: ${{ !inputs.push }}
+            maxTransferBytes: ${{ inputs.maxTransferBytes }}
+        dependsOn: []
+        weight: 0
+    dependsOn:
+      - inventory
+    weight: 0
+
+  - name: check
+    description: Compare source and destination inventories
+    steps:
+      - name: verify
+        description: >-
+          Rung 3. Metadata only -- Deep Archive cannot be read without a
+          restore, and the resource records contentVerified:false so no report
+          can present this as an integrity check.
+
+          Runs even when push was capped: a capped run leaves the destination
+          legitimately short, and recording that gap is how the next run's
+          progress becomes visible.
+        task:
+          type: model_method
+          modelIdOrName: archive-example-share
+          methodName: verify
+        dependsOn: []
+        weight: 0
+    dependsOn:
+      - transfer
+    weight: 0
+
+  - name: alert
+    description: Notify only on a genuine failure
+    steps:
+      - name: notify-failure
+        description: >-
+          Fires only when the transfer genuinely failed -- not when it was
+          inconclusive, and not when it simply had nothing to send.
+
+          Those three are different and conflating them is how an alert
+          channel becomes noise: `nothingToTransfer` is the steady state of a
+          healthy incremental archive, and `inconclusive` covers a transfer
+          cap or a retry exhaustion, neither of which says anything about
+          whether the archive is sound.
+        task:
+          type: model_method
+          modelIdOrName: apprise-serve
+          methodName: notify
+          inputs:
+            title: 'Glacier archive: push failed'
+            body: >-
+              ${{ 'Share ' +
+              data.latest('archive-example-share', 'example-share-transfer').attributes.shareName +
+              ' failed to archive: ' +
+              string(data.latest('archive-example-share', 'example-share-transfer').attributes.failureReason) }}
+            type: failure
+            format: markdown
+            when: >-
+              ${{ !data.latest('archive-example-share', 'example-share-transfer').attributes.passed &&
+              !data.latest('archive-example-share', 'example-share-transfer').attributes.inconclusive }}
+        dependsOn: []
+        weight: 0
+    dependsOn:
+      - check
+    weight: 0

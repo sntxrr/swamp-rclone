@@ -15,7 +15,7 @@ The homelab backs up 18 Linux hosts nightly with restic into per-host Backblaze
 B2 buckets, and `@sntxrr/restic-repository` validates that they restore. Every
 host in the fleet is covered.
 
-Except the Synology. It holds **13.79 TB** and has no off-site copy at all — the
+Except the Synology. It holds **13.8 TB** and has no off-site copy at all — the
 largest store of data in the house is the only machine with nothing behind it.
 
 The evidence that this was noticed before and never finished is still on the
@@ -49,7 +49,7 @@ is no Entware on this box, and a hand-installed binary does not survive a DSM
 upgrade. A container does.
 
 **It reports the recovery cost, not just the storage cost.** Storage is cheap
-enough to be invisible — $13.65/mo for 13.79 TB. Egress for a full recovery is
+enough to be invisible — $13.65/mo for 13.8 TB. Egress for a full recovery is
 **$1 241**. An archive whose recovery cost is first discovered *during* a
 recovery is an archive nobody can afford to use, so `scan` records that number
 every time it runs.
@@ -85,13 +85,45 @@ docker `--env-file` read from the SSH stdin pipe; see
 [`CONVENTIONS.md`](./CONVENTIONS.md) §6 for why the obvious `docker run -e …`
 spelling is wrong.
 
+## Packing
+
+Shares whose mean file size falls below ~1 MB are archived as tar streams
+rather than object-per-file, because Deep Archive bills 40 KB of overhead per
+object no matter how small the file.
+
+**One pack per top-level entry, with no size-based grouping.** That deliberately
+ignores the target pack size, and it is the most important decision in the
+design: grouping small directories toward a target makes pack boundaries a
+function of the *data*, so adding one file reshuffles the grouping, every
+downstream pack gets a new name, and the next push re-uploads the whole share —
+paying a fresh 180-day minimum on every object it replaced. Stable names are
+worth more than optimal packing, because an archive is written far more often
+than it is read.
+
+tar streams straight into `rclone rcat`, so nothing is staged on the NAS —
+volume1 is 53% full and a 400 GB temporary tar would not fit. `set -o pipefail`
+is what makes that trustworthy: without it a tar that dies halfway still exits
+0, and rclone faithfully stores the truncated stream as a complete object.
+
+A pack whose object already exists is **skipped**, not replaced; `--input
+repack=true` opts into replacement.
+
 ## Status
 
-**Wave 1.** `scan`, `push` (direct), `verify`, `restoreRequest` and
-`restoreDrill` are implemented, with 55 tests and every guard mutation-verified.
+Complete: `scan`, `push` (direct **and** pack), `verify`, `restoreRequest` and
+`restoreDrill` (including single-member extraction from a pack, which is what
+proves the packing is reversible).
 
-**Not yet implemented:** the `pack` strategy (PRD §4.1). `scan` will *choose*
-pack for small-file shares and record why, and `push` **refuses** to run in that
-mode rather than silently performing a direct copy while labelling the result a
-pack — a transfer resource that misreports its own strategy would make every
-downstream cost projection wrong.
+72 tests, and all 14 guards mutation-verified.
+
+**Not yet done:** live verification against the NAS. Nothing here has run
+against real hardware, so treat every rclone and DSM behaviour it relies on as
+asserted rather than observed.
+
+**Planned, not built:** metric emission to Prometheus, so a rung that has not
+run becomes an alert rather than something you have to remember to query —
+including a projected-cost line, which is the only same-day detector for a
+wrong storage class. See [`SETUP.md`](./SETUP.md) §8.
+
+[`SETUP.md`](./SETUP.md) also covers the AWS side and the out-of-band seed under
+herdr (§7); [`workflows/`](./workflows/) has scheduling templates.

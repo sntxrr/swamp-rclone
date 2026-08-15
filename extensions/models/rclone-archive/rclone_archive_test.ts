@@ -15,13 +15,22 @@ import {
   model,
   normalisePrefix,
   OBJECT_OVERHEAD_BYTES,
+  parseDu,
   parseSize,
   projectCost,
+  buildPackPlan,
+  buildPackScript,
+  buildExtractScript,
   RCLONE_EXIT,
   type RcloneResult,
   redactSecrets,
   runRclone,
   shQuote,
+  buildRemoteCommand,
+  ENV_FIFO_REF,
+  DEFAULT_STORAGE_CLASS,
+  S3_STORAGE_CLASSES,
+  ARCHIVE_STORAGE_CLASSES,
 } from "./rclone_archive.ts";
 
 const CREDS = {
@@ -32,7 +41,7 @@ const CREDS = {
 const DEST = {
   bucket: "example-archive-bucket",
   region: "us-west-2",
-  storageClass: "GLACIER_DEEP_ARCHIVE",
+  storageClass: "DEEP_ARCHIVE",
 };
 
 // ---------------------------------------------------------------------------
@@ -149,7 +158,7 @@ function result(over: Partial<RcloneResult> = {}): RcloneResult {
 }
 
 // ---------------------------------------------------------------------------
-// shQuote — the paths in these tests are real entries on volume1
+// shQuote — these shapes all occur on a real Synology volume
 // ---------------------------------------------------------------------------
 
 Deno.test("shQuote survives a path containing a space", () => {
@@ -158,8 +167,8 @@ Deno.test("shQuote survives a path containing a space", () => {
 
 Deno.test("shQuote survives parentheses, which are sh syntax errors bare", () => {
   assertEquals(
-    shQuote("/volume1/twilight-tears(mix).mp3"),
-    `'/volume1/twilight-tears(mix).mp3'`,
+    shQuote("/volume1/live-set(final mix).wav"),
+    `'/volume1/live-set(final mix).wav'`,
   );
 });
 
@@ -248,7 +257,7 @@ Deno.test("the storage class is injected when absent", async () => {
       sourceMount: "/volume1/homes",
     }, ["copy", "/data", "dest:bucket/x"]);
     const remote = ssh.argv().at(-1) ?? "";
-    assertStringIncludes(remote, `'--s3-storage-class' 'GLACIER_DEEP_ARCHIVE'`);
+    assertStringIncludes(remote, `'--s3-storage-class' 'DEEP_ARCHIVE'`);
   } finally {
     ssh.cleanup();
   }
@@ -299,7 +308,7 @@ Deno.test("no credential reaches the remote command line", async () => {
     assert(!joined.includes(CREDS.accessKeyId));
     // ...but it does reach the container, via the stdin env-file.
     assertStringIncludes(ssh.stdin(), CREDS.secretAccessKey);
-    assertStringIncludes(ssh.argv().at(-1) ?? "", "--env-file' '/dev/stdin");
+    assertStringIncludes(ssh.argv().at(-1) ?? "", `'--env-file' "$ENVF"`);
   } finally {
     ssh.cleanup();
   }
@@ -320,7 +329,7 @@ Deno.test("buildEnvFile omits empty credentials entirely", () => {
   const body = buildEnvFile({ accessKeyId: "", secretAccessKey: "" }, DEST);
   assert(!body.includes("ACCESS_KEY_ID"));
   assert(!body.includes("SECRET_ACCESS_KEY"));
-  assertStringIncludes(body, "RCLONE_CONFIG_DEST_STORAGE_CLASS=GLACIER_DEEP_ARCHIVE");
+  assertStringIncludes(body, "RCLONE_CONFIG_DEST_STORAGE_CLASS=DEEP_ARCHIVE");
 });
 
 Deno.test("a source-only scan ships no credentials to the NAS", async () => {
@@ -403,7 +412,7 @@ Deno.test("small mean file size chooses pack", () => {
 });
 
 Deno.test("large mean file size chooses direct", () => {
-  // plex-data: ~30k files averaging >100 MB.
+  // media-library: ~30k files averaging >100 MB.
   assertEquals(chooseStrategy(30_000, 3.76e12, 1024 * 1024), "direct");
 });
 
@@ -467,9 +476,9 @@ Deno.test("scan records an unreachable share instead of throwing", async () => {
 
 Deno.test("scan projects cost and raises a churn warning", async () => {
   const ssh = await fakeSsh(`echo '{"count":157000,"bytes":1260000000000}'`);
-  const { written, context } = testContext(baseArgs(ssh.path, { shareName: "time-machine" }));
+  const { written, context } = testContext(baseArgs(ssh.path, { shareName: "mac-backups" }));
   try {
-    // time-machine's sparsebundle bands: high churn against a 180-day minimum.
+    // sparsebundle bands: high churn against a 180-day minimum.
     await model.methods.scan.execute({ previousBytes: 1_000_000_000_000 }, context);
     const d = written[0].data as Record<string, number | boolean>;
     assertEquals(d.churnWarning, true);
@@ -519,14 +528,263 @@ Deno.test("push copies and never syncs", async () => {
   }
 });
 
-Deno.test("push refuses pack rather than mislabelling a direct copy", async () => {
+// ---------------------------------------------------------------------------
+// Packing
+// ---------------------------------------------------------------------------
+
+Deno.test("parseDu splits on the first tab, not on whitespace", () => {
+  // volume1 really does contain directory names with spaces.
+  const out = parseDu("12\t/data/Resilio Sync\n4096\t/data/homes\n");
+  assertEquals(out, [
+    { name: "Resilio Sync", bytes: 12 * 1024 },
+    { name: "homes", bytes: 4096 * 1024 },
+  ]);
+});
+
+Deno.test("parseDu ignores lines that are not du output", () => {
+  assertEquals(parseDu("du: cannot read\n\nrubbish\n"), []);
+});
+
+Deno.test("a pack plan is one pack per top-level entry, sorted", () => {
+  const plan = buildPackPlan(
+    [
+      { name: "zeta", bytes: 3 },
+      { name: "alpha", bytes: 1 },
+      { name: "mid", bytes: 2 },
+    ],
+    0,
+  );
+  assertEquals(plan.map((p) => p.name), ["alpha", "mid", "zeta"]);
+  assertEquals(plan.map((p) => p.member), ["alpha", "mid", "zeta"]);
+});
+
+Deno.test("pack boundaries do NOT shift when a directory grows", () => {
+  // The whole point of refusing size-based grouping: an archive whose object
+  // names move when data changes re-uploads everything and pays a fresh
+  // 180-day minimum on each replaced object.
+  const before = buildPackPlan(
+    [{ name: "a", bytes: 10 }, { name: "b", bytes: 10 }, { name: "c", bytes: 10 }],
+    0,
+  );
+  const after = buildPackPlan(
+    [
+      { name: "a", bytes: 10 },
+      { name: "b", bytes: 900_000_000_000 },
+      { name: "c", bytes: 10 },
+    ],
+    0,
+  );
+  assertEquals(before.map((p) => p.name), after.map((p) => p.name));
+});
+
+Deno.test("loose files in the share root become a single _root pack", () => {
+  const plan = buildPackPlan([{ name: "homes", bytes: 5 }], 1234);
+  assertEquals(plan.length, 2);
+  const root = plan.find((p) => p.name === "_root");
+  assert(root, "_root pack must exist when loose files are present");
+  assertEquals(root?.member, ".");
+});
+
+Deno.test("no _root pack is created when the share root has no loose files", () => {
+  assertEquals(buildPackPlan([{ name: "homes", bytes: 5 }], 0).length, 1);
+});
+
+Deno.test("the pack script sets pipefail — without it a broken tar uploads truncated", () => {
+  const script = buildPackScript("homes", "dest:b/x/homes.tar", "DEEP_ARCHIVE");
+  assertStringIncludes(script, "set -o pipefail");
+  // Without pipefail the exit status is rclone's alone, so a tar that dies
+  // halfway still exits 0 and the truncated stream is stored as complete.
+  assertStringIncludes(script, "tar -C /data -cf -");
+  assertStringIncludes(script, "rclone rcat");
+  assertStringIncludes(script, "--s3-storage-class");
+});
+
+Deno.test("the pack script quotes a member name containing a space", () => {
+  const script = buildPackScript("Resilio Sync", "dest:b/x/a.tar", "GLACIER");
+  assertStringIncludes(script, `'Resilio Sync'`);
+});
+
+Deno.test("a shell-entrypoint write without the storage class is refused", async () => {
+  // Appending the flag here would make it a positional parameter of `sh`,
+  // which rclone never sees — the silent 23x mistake wearing the guard's
+  // own clothes.
+  await assertRejects(
+    () =>
+      runRclone(CREDS, DEST, {
+        sshHost: "nas.example.invalid",
+        sshBinary: "/bin/false",
+        sourceMount: "/volume1/homes",
+        entrypoint: "sh",
+      }, ["-c", "tar -cf - . | rclone rcat dest:b/x.tar"]),
+    Error,
+    "silently land at S3 Standard rates",
+  );
+});
+
+Deno.test("a source-only shell invocation needs no storage class", async () => {
+  // No credentials means rclone cannot reach S3 at all, so there is no class
+  // to name. The exemption keys on credentials, not on a caller's assertion.
+  const ssh = await fakeSsh(`echo '4\t/data/homes'`);
+  try {
+    const r = await runRclone(
+      { accessKeyId: "", secretAccessKey: "" },
+      DEST,
+      {
+        sshHost: "nas.example.invalid",
+        sshBinary: ssh.path,
+        sourceMount: "/volume1/homes",
+        entrypoint: "sh",
+      },
+      ["-c", "du -sk /data/*"],
+    );
+    assertEquals(r.code, 0);
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("push in pack mode skips packs whose object already exists", async () => {
+  // du lists one entry; lsjson then reports the object present.
+  const ssh = await fakeSsh(
+    `case "$*" in
+  *"du -sk"*) echo '4\t/data/homes'; echo '0\t/data/.' ;;
+  *lsjson*) echo '[{"Path":"homes.tar","Size":1}]' ;;
+  *) exit 0 ;;
+esac`,
+  );
+  const { written, context } = testContext(baseArgs(ssh.path, { strategy: "pack" }));
+  try {
+    await model.methods.push.execute({}, context);
+    const d = written[0].data as Record<string, unknown>;
+    assertEquals(d.strategy, "pack");
+    assertEquals(d.packsPlanned, 1);
+    assertEquals(d.packsSkipped, 1);
+    assertEquals(d.packsUploaded, 0);
+    assertEquals(d.passed, true);
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("push in pack mode uploads a pack that does not yet exist", async () => {
+  const ssh = await fakeSsh(
+    `case "$*" in
+  *"du -sk"*) echo '4\t/data/homes'; echo '0\t/data/.' ;;
+  *lsjson*) echo '[]' ;;
+  *) exit 0 ;;
+esac`,
+  );
+  const { written, context } = testContext(baseArgs(ssh.path, { strategy: "pack" }));
+  try {
+    await model.methods.push.execute({}, context);
+    const d = written[0].data as Record<string, unknown>;
+    assertEquals(d.packsUploaded, 1);
+    assertEquals(d.packsSkipped, 0);
+    assertEquals(d.passed, true);
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("push in pack mode records which packs failed, not just that one did", async () => {
+  const ssh = await fakeSsh(
+    `case "$*" in
+  *"du -sk"*) echo '4\t/data/homes'; echo '0\t/data/.' ;;
+  *lsjson*) echo '[]' ;;
+  *) echo "tar: read error" >&2; exit 2 ;;
+esac`,
+  );
+  const { written, context } = testContext(baseArgs(ssh.path, { strategy: "pack" }));
+  try {
+    await model.methods.push.execute({}, context);
+    const d = written[0].data as Record<string, unknown>;
+    assertEquals(d.passed, false);
+    assertEquals(d.packsFailed, 1);
+    assertEquals(d.failedPacks, ["homes"]);
+    assertEquals(d.failureReason, "pack-failed");
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("push in pack dry-run mode uploads nothing", async () => {
+  const ssh = await fakeSsh(
+    `case "$*" in
+  *"du -sk"*) echo '4\t/data/homes'; echo '0\t/data/.' ;;
+  *lsjson*) echo '[]' ;;
+  *rcat*) echo "SHOULD NOT RUN" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac`,
+  );
+  const { written, context } = testContext(baseArgs(ssh.path, { strategy: "pack" }));
+  try {
+    await model.methods.push.execute({ dryRun: true }, context);
+    const d = written[0].data as Record<string, unknown>;
+    assertEquals(d.dryRun, true);
+    assertEquals(d.passed, true);
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Cadence: --no-traverse is a cost trap without a window
+// ---------------------------------------------------------------------------
+
+Deno.test("a full push traverses rather than HEADing every file", async () => {
+  // Without a window, --no-traverse would issue one HEAD per source file —
+  // ~80x the cost of one destination listing, and ~$1,460/mo at hourly
+  // against ~$18/mo. So no window means no --no-traverse.
   const ssh = await fakeSsh("exit 0");
   const { context } = testContext(baseArgs(ssh.path));
   try {
-    await assertRejects(
-      () => model.methods.push.execute({ strategy: "pack" }, context),
-      Error,
-      "wave 2",
+    await model.methods.push.execute({}, context);
+    const remote = ssh.argv().at(-1) ?? "";
+    assert(
+      !remote.includes("--no-traverse"),
+      "--no-traverse must not appear without a --max-age window",
+    );
+    assert(!remote.includes("--max-age"));
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("a windowed push enables --no-traverse, and only then", async () => {
+  const ssh = await fakeSsh("exit 0");
+  const { context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.push.execute({ maxAgeMinutes: 120 }, context);
+    const remote = ssh.argv().at(-1) ?? "";
+    assertStringIncludes(remote, "'--max-age' '120m'");
+    assertStringIncludes(remote, "--no-traverse");
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("the window can be set on the model, not just per run", async () => {
+  const ssh = await fakeSsh("exit 0");
+  const { context } = testContext(baseArgs(ssh.path, { maxAgeMinutes: 90 }));
+  try {
+    await model.methods.push.execute({}, context);
+    assertStringIncludes(ssh.argv().at(-1) ?? "", "'--max-age' '90m'");
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("--immutable is on by default and removable only deliberately", async () => {
+  const ssh = await fakeSsh("exit 0");
+  const { context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.push.execute({}, context);
+    assertStringIncludes(ssh.argv().at(-1) ?? "", "--immutable");
+
+    await model.methods.push.execute({ allowOverwrite: true }, context);
+    assert(
+      !(ssh.argv().at(-1) ?? "").includes("--immutable"),
+      "allowOverwrite must drop --immutable",
     );
   } finally {
     ssh.cleanup();
@@ -622,6 +880,62 @@ Deno.test("restoreDrill reports a still-retrieving object as pending", async () 
   }
 });
 
+Deno.test("the extract script sets pipefail — a missing member must not hash empty", () => {
+  const s = buildExtractScript("dest:b/x/homes.tar", "homes/don/notes.txt", "GLACIER");
+  assertStringIncludes(s, "set -o pipefail");
+  // Without pipefail, tar failing on a missing member still lets sha256sum
+  // exit 0 having hashed nothing — a green drill for absent data.
+  assertStringIncludes(s, "tar -xOf -");
+  assertStringIncludes(s, "sha256sum");
+  assertStringIncludes(s, `'homes/don/notes.txt'`);
+});
+
+Deno.test("restoreDrill on a pack extracts one member, proving it unpacks", async () => {
+  const ssh = await fakeSsh(
+    `case "$*" in
+  *"size"*) echo '{"count":1,"bytes":100}' ;;
+  *) echo "deadbeef  -" ;;
+esac`,
+  );
+  const { written, context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.restoreDrill.execute(
+      { objectPath: "homes.tar", member: "homes/don/notes.txt", sourceSha256: "deadbeef" },
+      context,
+    );
+    const d = written[0].data as Record<string, unknown>;
+    assertEquals(d.phase, "restored");
+    assertEquals(d.contentMatched, true);
+    assertEquals(d.passed, true);
+    // The extraction must actually have gone through tar, not hashed the pack.
+    assertStringIncludes(ssh.argv().at(-1) ?? "", "tar -xOf -");
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("restoreDrill fails loudly on a content mismatch", async () => {
+  const ssh = await fakeSsh(
+    `case "$*" in
+  *"size"*) echo '{"count":1,"bytes":100}' ;;
+  *) echo "0000000  -" ;;
+esac`,
+  );
+  const { written, context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.restoreDrill.execute(
+      { objectPath: "a.tar", sourceSha256: "deadbeef" },
+      context,
+    );
+    const d = written[0].data as Record<string, unknown>;
+    assertEquals(d.contentMatched, false);
+    assertEquals(d.passed, false);
+    assertEquals(d.failureReason, "content-mismatch");
+  } finally {
+    ssh.cleanup();
+  }
+});
+
 Deno.test("restoreDrill refuses an object above the byte ceiling", async () => {
   const ssh = await fakeSsh(`echo '{"count":1,"bytes":9999999999999}'`);
   const { context } = testContext(baseArgs(ssh.path, { maxRestoreBytes: 1024 }));
@@ -658,9 +972,14 @@ Deno.test("the archive-storage-class check rejects a non-archive tier", async ()
   });
   assertEquals(bad.pass, false);
   // The message must quantify the mistake, not merely name it — "wrong tier"
-  // is ignorable, "$317/mo instead of $14/mo" is not.
+  // is ignorable, "23x the price" is not. It must quantify it in RATES rather
+  // than in one deployment's bill: this extension is published, and a figure
+  // derived from the author's own volume is both a disclosure and meaningless
+  // to everyone else who installs it.
   assertStringIncludes(bad.errors?.[0] ?? "", "not an archive tier");
-  assertStringIncludes(bad.errors?.[0] ?? "", "$317/mo");
+  assertStringIncludes(bad.errors?.[0] ?? "", "23x");
+  assertStringIncludes(bad.errors?.[0] ?? "", "0.00099");
+  assert(!/\b13\.79\b/.test(bad.errors?.[0] ?? ""), "no volume-specific size");
 
   const good = await model.checks["archive-storage-class"].execute({
     globalArgs: {} as never,
@@ -683,4 +1002,220 @@ Deno.test("every resource spec has a schema and the methods write only those", (
   assertEquals(specs.has("verification"), true);
   assertEquals(specs.has("retrieval"), true);
   assertEquals(Object.keys(model.methods).length, 5);
+});
+
+Deno.test("each spec writes a DISTINCT instance name", async () => {
+  // data.latest(model, name) resolves by resource INSTANCE name, not by spec.
+  // If scan, push and verify all wrote instance "homes", a workflow could not
+  // say which resource it meant — and the failure would be an expression
+  // evaluation error a few milliseconds in, which allowFailure would then
+  // report as a successful run.
+  const ssh = await fakeSsh(`echo '{"count":5,"bytes":5000}'`);
+  const { written, context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.scan.execute({}, context);
+    await model.methods.push.execute({}, context);
+    await model.methods.verify.execute({}, context);
+    const names = written.map((w) => w.instance);
+    assertEquals(names.length, new Set(names).size, `collided: ${names}`);
+    assertEquals(names, ["homes", "homes-transfer", "homes-verification"]);
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The env-file FIFO — DSM refuses to open /dev/stdin, so the env file is
+// streamed through a FIFO instead. See buildRemoteCommand.
+// ---------------------------------------------------------------------------
+
+Deno.test("the env-file path is the ONE word left unquoted, so it expands", () => {
+  const remote = buildRemoteCommand([
+    "/usr/local/bin/docker",
+    "run",
+    "--env-file",
+    ENV_FIFO_REF,
+    "rclone/rclone:1.75.0",
+  ]);
+  // Unquoted so the shell expands it...
+  assertStringIncludes(remote, `'--env-file' "$ENVF"`);
+  // ...and never as a literal, which docker would try to open as a filename.
+  assert(
+    !remote.includes(`'$ENVF'`),
+    "a quoted $ENVF would reach docker as a literal filename",
+  );
+  // Everything else still goes through shQuote.
+  assertStringIncludes(remote, `'rclone/rclone:1.75.0'`);
+});
+
+Deno.test("the sentinel must appear exactly once", () => {
+  for (
+    const words of [
+      ["/usr/local/bin/docker", "run", "img"],
+      ["/usr/local/bin/docker", ENV_FIFO_REF, ENV_FIFO_REF, "img"],
+    ]
+  ) {
+    let threw = false;
+    try {
+      buildRemoteCommand(words);
+    } catch (e) {
+      threw = true;
+      assertStringIncludes(String(e), "exactly once");
+    }
+    assert(threw, `expected a throw for ${words.length} words`);
+  }
+});
+
+Deno.test("the real stdin is preserved on fd 3", () => {
+  const remote = buildRemoteCommand(["docker", "--env-file", ENV_FIFO_REF]);
+  // A backgrounded command in a POSIX shell reads stdin from /dev/null. If the
+  // writer is not explicitly pointed at the saved fd, the env file arrives
+  // EMPTY and rclone runs with no credentials while exit codes look healthy.
+  assertStringIncludes(remote, "exec 3<&0");
+  assertStringIncludes(remote, 'cat <&3 > "$ENVF"');
+});
+
+Deno.test("the writer is killed, never waited on", () => {
+  const remote = buildRemoteCommand(["docker", "--env-file", ENV_FIFO_REF]);
+  // If docker dies before opening the FIFO, the writer is still blocked in
+  // open(). Waiting on it would hang the run until the six-hour timeout.
+  assert(
+    !/\bwait\b/.test(remote),
+    "waiting on the FIFO writer deadlocks when docker fails early",
+  );
+  assertStringIncludes(remote, 'kill "$CATPID"');
+});
+
+Deno.test("the FIFO is private and removed on every exit path", () => {
+  const remote = buildRemoteCommand(["docker", "--env-file", ENV_FIFO_REF]);
+  assertStringIncludes(remote, "mkfifo -m 600");
+  assertStringIncludes(remote, `trap 'rm -rf "$D"' EXIT INT TERM`);
+});
+
+Deno.test("the remote shell really delivers the env file, and propagates the exit code", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "rclone-fifo-" });
+  try {
+    const docker = `${dir}/docker`;
+    const seen = `${dir}/seen`;
+    // A stand-in for docker that copies out whatever --env-file pointed at,
+    // then exits non-zero so exit-code propagation is proven too.
+    await Deno.writeTextFile(
+      docker,
+      `#!/bin/sh
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--env-file" ]; then shift; cat "$1" > ${seen}; fi
+  shift
+done
+exit 7
+`,
+    );
+    await Deno.chmod(docker, 0o755);
+
+    const remote = buildRemoteCommand([
+      docker,
+      "run",
+      "--env-file",
+      ENV_FIFO_REF,
+      "rclone/rclone:1.75.0",
+    ]);
+
+    const child = new Deno.Command("/bin/sh", {
+      args: ["-c", remote],
+      stdin: "piped",
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    const writer = child.stdin.getWriter();
+    await writer.write(
+      new TextEncoder().encode("RCLONE_CONFIG_DEST_SECRET_ACCESS_KEY=s3cr3t\n"),
+    );
+    await writer.close();
+    const output = await child.output();
+
+    assertEquals(output.code, 7, "docker's exit code must survive the wrapper");
+    assertEquals(
+      await Deno.readTextFile(seen),
+      "RCLONE_CONFIG_DEST_SECRET_ACCESS_KEY=s3cr3t\n",
+      "the env file must arrive intact through the FIFO",
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("docker failing before it opens the FIFO does not hang", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "rclone-fifo-" });
+  try {
+    const docker = `${dir}/docker`;
+    // Never reads --env-file at all — the writer stays blocked in open().
+    await Deno.writeTextFile(docker, "#!/bin/sh\nexit 125\n");
+    await Deno.chmod(docker, 0o755);
+
+    const remote = buildRemoteCommand([docker, "--env-file", ENV_FIFO_REF]);
+    const child = new Deno.Command("/bin/sh", {
+      args: ["-c", remote],
+      stdin: "piped",
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+    const writer = child.stdin.getWriter();
+    await writer.write(new TextEncoder().encode("K=v\n"));
+    await writer.close();
+
+    const output = await Promise.race([
+      child.output(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("deadlocked")), 15_000)
+      ),
+    ]);
+    assertEquals(output.code, 125);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The storage class must be one S3 actually accepts.
+//
+// GLACIER_DEEP_ARCHIVE was the default here, and sat in the check's own
+// allowlist, until a live run rejected all 37 objects with 400
+// InvalidStorageClass. The guard reported it as a valid archive tier because
+// it only ever compared against a hand-written list.
+// ---------------------------------------------------------------------------
+
+Deno.test("the default storage class is one S3 accepts", () => {
+  assertEquals(DEFAULT_STORAGE_CLASS, "DEEP_ARCHIVE");
+  assert(
+    S3_STORAGE_CLASSES.includes(DEFAULT_STORAGE_CLASS),
+    "the default must be a real S3 storage class",
+  );
+  assert(
+    ARCHIVE_STORAGE_CLASSES.includes(DEFAULT_STORAGE_CLASS),
+    "the default must be an archive tier",
+  );
+});
+
+Deno.test("GLACIER_DEEP_ARCHIVE is not a storage class and must be refused", async () => {
+  const r = await model.checks["archive-storage-class"].execute({
+    globalArgs: { storageClass: "GLACIER_DEEP_ARCHIVE" } as never,
+  });
+  assertEquals(r.pass, false);
+  // It must fail as INVALID, not as "not an archive tier" — the whole bug was
+  // that the two were conflated.
+  assertStringIncludes(String(r.errors), "InvalidStorageClass");
+  assertStringIncludes(String(r.errors), "does not exist");
+});
+
+Deno.test("every archive class is also a valid S3 class", () => {
+  for (const c of ARCHIVE_STORAGE_CLASSES) {
+    assert(S3_STORAGE_CLASSES.includes(c), `${c} is not a valid S3 class`);
+  }
+});
+
+Deno.test("a valid but non-archive class still fails, on cost grounds", async () => {
+  const r = await model.checks["archive-storage-class"].execute({
+    globalArgs: { storageClass: "STANDARD" } as never,
+  });
+  assertEquals(r.pass, false);
+  assertStringIncludes(String(r.errors), "23x");
 });

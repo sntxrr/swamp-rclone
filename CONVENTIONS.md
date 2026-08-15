@@ -139,7 +139,7 @@ outcome rather than an error.
 
 ### 4.2 The storage class must be injected, not trusted
 
-Uploading without `--s3-storage-class GLACIER_DEEP_ARCHIVE` silently writes at
+Uploading without `--s3-storage-class DEEP_ARCHIVE` silently writes at
 S3 Standard rates — **23× the cost** — and nothing in rclone's output says so.
 The mistake is invisible until a bill arrives a month later, and fixing it
 afterwards means re-uploading (and paying the minimum-duration charge on
@@ -192,11 +192,11 @@ with spaces and hands the result to the remote user's login shell, which re-word
 and glob-expands it. Any argument containing a space, quote, `$`, `*` or `(`
 is silently mangled or interpreted.
 
-This is not a hypothetical on this box. volume1 contains, today:
+This is not hypothetical. A Synology volume routinely contains names like:
 
 ```
 /volume1/Resilio Sync                       ← space
-/volume1/twilight-tears(sntxrrs-...).mp3    ← parentheses
+/volume1/live-set(final mix).wav    ← parentheses
 ```
 
 A path with a space becomes two arguments; parentheses are a syntax error in
@@ -464,6 +464,61 @@ export function isInconclusive(result: RcloneResult): boolean {
     result.code === RCLONE_EXIT.DURATION_LIMIT;
 }
 ```
+
+### 5.3 The env file is a FIFO, because DSM will not open `/dev/stdin`
+
+The obvious way to keep a credential out of argv is
+`docker run --env-file /dev/stdin` with the env file written down the SSH pipe.
+**On DSM that does not work**, and it fails in the most expensive way available:
+docker exits 125 before rclone starts, which reads as "the share is
+unreachable" rather than "the transport is broken".
+
+```
+$ echo K=v | ssh nas '/usr/local/bin/docker run --rm --env-file /dev/stdin ...'
+docker: open /dev/stdin: permission denied.
+```
+
+It is not a docker problem and not a permissions problem in the usual sense.
+Plain `cat /dev/stdin` fails the same way, while `cat` reading fd 0 directly
+succeeds — and fd 0 is an ordinary pipe owned by the SSH user, mode
+`lr-x------`, with no `hidepid` on `/proc`. Only *opening the path* is denied;
+`/proc/self/fd/0` is refused identically.
+
+So the remote shell creates a FIFO in a private 0700 directory and streams the
+env file through it. The bytes live in a kernel buffer, so the credential still
+never touches the NAS filesystem and still never appears in argv on either
+host:
+
+```sh
+exec 3<&0                                     # see below — this line is load-bearing
+D=$(mktemp -d "${TMPDIR:-/tmp}/rclone.XXXXXX") || exit 125
+trap 'rm -rf "$D"' EXIT INT TERM
+ENVF="$D/env"
+mkfifo -m 600 "$ENVF" || exit 125
+cat <&3 > "$ENVF" & CATPID=$!
+<docker …  --env-file "$ENVF"  …>; rc=$?
+kill "$CATPID" 2>/dev/null
+exit $rc
+```
+
+Three details are not stylistic:
+
+- **`exec 3<&0`, and `cat <&3`.** A backgrounded command in a POSIX shell has
+  its stdin redirected from `/dev/null`. Without the saved descriptor the FIFO
+  receives an **empty** env file, rclone runs with no credentials, and the
+  failure surfaces as an authentication error rather than as a bug here.
+- **`kill`, never `wait`.** If docker dies before opening the FIFO — a bad
+  flag, a missing image — the writer is still blocked in `open()`. Waiting on
+  it hangs the run until the six-hour timeout.
+- **`rc=$?` then `exit $rc`.** Everything downstream classifies on the exit
+  code (§4.1); a wrapper that returns its own status makes every failure
+  unclassifiable.
+
+`--env-file` is the one word in the docker argv that must **not** be
+`shQuote`d, since it has to reach the shell as a live `"$ENVF"` expansion.
+That exception is represented by a NUL-delimited sentinel so it can never
+collide with a caller-supplied argument, and `buildRemoteCommand` refuses to
+run if the sentinel does not appear exactly once.
 
 ---
 

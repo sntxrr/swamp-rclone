@@ -1,0 +1,87 @@
+# Example workflow — prove the archive can actually be restored.
+#
+# NOT deployed from this repo. Copy into the implementation repo, give it a
+# fresh uuid, and point modelIdOrName at a real instance.
+#
+# Separate from the archive workflow on purpose. Deep Archive retrieval takes
+# 12-48 hours, so request and collect cannot live in one DAG: a step that
+# waited would hold the per-model lock for two days, blocking the archive
+# workflow that shares it.
+#
+# The split is therefore two workflows on offset schedules, each doing one
+# half. Neither blocks, and both are safe to run when there is nothing to do.
+id: 00000000-0000-0000-0000-000000000001
+name: archive-example-share-drill
+description: >-
+  Request a retrieval from Deep Archive, then collect it a day later and
+  verify the bytes.
+
+  This is the only rung that proves anything. scan, push and verify all compare
+  metadata, and metadata cannot see corruption -- a share can pass every other
+  rung while holding an object that will not open. An archive that has never
+  been restored is an assumption.
+
+  It costs money, deliberately and in a bounded way: one small object, bulk
+  tier, under a byte ceiling checked before the request is issued. The point is
+  to exercise the path often enough that the first real restore is not the
+  first restore.
+tags: {}
+# Monthly, on the 1st. Frequent enough that a broken retrieval path is found
+# in weeks rather than during an outage; rare enough that the egress is
+# noise. Bulk retrieval is $0.0025/GB and egress $0.09/GB, so a 1 GiB drill is
+# roughly $0.10 -- about $1.20 a year to know the archive works.
+trigger:
+  schedule: "0 4 1 * *"
+inputs:
+  properties:
+    objectPath:
+      type: string
+      description: >-
+        Key to drill, relative to the share prefix. For a packed share this is
+        a .tar; pair it with `member` to prove the pack actually unpacks.
+    member:
+      type: string
+      description: >-
+        Packed shares only. Extract and hash this single member rather than the
+        whole pack. Hashing a pack proves it downloaded; extracting a member
+        proves it OPENS, which is the thing that matters and the thing a whole
+        pack hash will never notice.
+      default: ""
+    sourceSha256:
+      type: string
+      description: >-
+        Expected hash of the source file. Without it the drill proves the bytes
+        arrived but not that they are the RIGHT bytes -- which is most of the
+        value. Compute it on the NAS and store it alongside the plan.
+      default: ""
+  required:
+    - objectPath
+jobs:
+  - name: request
+    description: Ask S3 to bring the object back
+    steps:
+      - name: restore-request
+        description: >-
+          Rung 4. Spends money, so it carries an explicit acknowledgement.
+
+          allowRestore is passed here rather than armed permanently on the
+          model. A flag set on the definition is armed for every future run
+          including accidental ones; passed per run, the acknowledgement means
+          what it says. This is also why there is no pre-flight check gating
+          it -- checks see only globalArgs, so one would reject this input
+          before execute ever ran.
+
+          Bulk tier: 48 hours, and an eighth the price of Standard. Nothing
+          about a scheduled drill is urgent.
+        task:
+          type: model_method
+          modelIdOrName: archive-example-share
+          methodName: restoreRequest
+          inputs:
+            objectPath: ${{ inputs.objectPath }}
+            tier: Bulk
+            allowRestore: true
+        dependsOn: []
+        weight: 0
+    dependsOn: []
+    weight: 0
