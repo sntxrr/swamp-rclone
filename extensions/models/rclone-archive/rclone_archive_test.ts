@@ -31,6 +31,10 @@ import {
   DEFAULT_STORAGE_CLASS,
   S3_STORAGE_CLASSES,
   ARCHIVE_STORAGE_CLASSES,
+  buildRestoreArgs,
+  parseRestoreStatus,
+  isRestoreAlreadyInProgress,
+  escapeFilterPattern,
 } from "./rclone_archive.ts";
 
 const CREDS = {
@@ -852,7 +856,11 @@ Deno.test("restoreRequest refuses to spend money without acknowledgement", async
 });
 
 Deno.test("restoreRequest proceeds with a per-run acknowledgement", async () => {
-  const ssh = await fakeSsh("exit 0");
+  // rclone reports the per-object outcome in JSON on stdout; a bare `exit 0`
+  // means it restored NOTHING, which is a failure — see the next test.
+  const ssh = await fakeSsh(
+    `echo '[{ "Status": "OK", "Remote": "b.tar" }]'`,
+  );
   const { written, context } = testContext(baseArgs(ssh.path));
   try {
     await model.methods.restoreRequest.execute(
@@ -861,6 +869,61 @@ Deno.test("restoreRequest proceeds with a per-run acknowledgement", async () => 
     );
     assertEquals(written[0].data.phase, "requested");
     assertEquals(written[0].data.tier, "Bulk");
+    assertEquals(written[0].data.passed, true);
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("a clean exit that restored NOTHING is recorded as a failure", async () => {
+  // The shape of a typo'd objectPath: rclone exits 0 having matched nothing.
+  // Recorded as success, this surfaces as a drill that cannot pass, hours later.
+  const ssh = await fakeSsh("exit 0");
+  const { written, context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.restoreRequest.execute(
+      { objectPath: "a/typo.tar", allowRestore: true },
+      context,
+    );
+    assertEquals(written[0].data.phase, "failed");
+    assertEquals(written[0].data.passed, false);
+    assertEquals(written[0].data.failureReason, "no-object-matched");
+    assertStringIncludes(String(written[0].data.detail), "path is almost certainly wrong");
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("re-requesting an in-flight restore is idempotent, not a failure", async () => {
+  const ssh = await fakeSsh(
+    `echo '[{ "Status": "operation error S3: RestoreObject, api error RestoreAlreadyInProgress: Object restore is already in progress", "Remote": "b.tar" }]'`,
+  );
+  const { written, context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.restoreRequest.execute(
+      { objectPath: "a/b.tar", allowRestore: true },
+      context,
+    );
+    assertEquals(written[0].data.passed, true);
+    assertEquals(written[0].data.phase, "requested");
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("a rejected per-object restore fails despite rclone exiting 0", async () => {
+  const ssh = await fakeSsh(
+    `echo '[{ "Status": "operation error S3: RestoreObject, api error AccessDenied", "Remote": "b.tar" }]'`,
+  );
+  const { written, context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.restoreRequest.execute(
+      { objectPath: "a/b.tar", allowRestore: true },
+      context,
+    );
+    assertEquals(written[0].data.passed, false);
+    assertEquals(written[0].data.failureReason, "restore-rejected");
+    assertStringIncludes(String(written[0].data.detail), "AccessDenied");
   } finally {
     ssh.cleanup();
   }
@@ -1218,4 +1281,86 @@ Deno.test("a valid but non-archive class still fails, on cost grounds", async ()
   });
   assertEquals(r.pass, false);
   assertStringIncludes(String(r.errors), "23x");
+});
+
+// ---------------------------------------------------------------------------
+// restoreRequest — all three of these were found by attempting a real drill,
+// and all three are invisible to the exit code.
+// ---------------------------------------------------------------------------
+
+Deno.test("restore roots at the parent directory, not the object", () => {
+  const argv = buildRestoreArgs("dest:b/nas/share", "a/b/kick.wav", "Standard");
+  // Handed the object path directly, rclone fails "is a file not a directory".
+  assert(!argv.includes("dest:b/nas/share/a/b/kick.wav"));
+  assertStringIncludes(argv.join(" "), "dest:b/nas/share/a/b");
+  assertStringIncludes(argv.join(" "), "--include /kick.wav");
+});
+
+Deno.test("the include is anchored, or it restores every matching name in the share", () => {
+  const argv = buildRestoreArgs("dest:b/share", "deep/nested/chords.mid", "Bulk");
+  const include = argv[argv.indexOf("--include") + 1];
+  // Unanchored, this matches chords.mid at ANY depth — and every object it
+  // matches is retrieved and billed.
+  assertEquals(include, "/chords.mid");
+});
+
+Deno.test("an object at the share root still restores", () => {
+  const argv = buildRestoreArgs("dest:b/share", "top.txt", "Bulk");
+  assertEquals(argv[2], "dest:b/share");
+  assertEquals(argv[argv.indexOf("--include") + 1], "/top.txt");
+});
+
+Deno.test("a directory objectPath is refused rather than restoring everything", () => {
+  let threw = false;
+  try {
+    buildRestoreArgs("dest:b/share", "some/dir/", "Bulk");
+  } catch (e) {
+    threw = true;
+    assertStringIncludes(String(e), "every retrieved byte is billed");
+  }
+  assert(threw, "a trailing slash must not silently restore a whole directory");
+});
+
+Deno.test("glob metacharacters in a filename are escaped, not interpreted", () => {
+  assertEquals(escapeFilterPattern("take[1].wav"), "take\\[1\\].wav");
+  assertEquals(escapeFilterPattern("mix{a,b}.wav"), "mix\\{a,b\\}.wav");
+  assertEquals(escapeFilterPattern("stem*.wav"), "stem\\*.wav");
+  // Parentheses are NOT rclone filter operators and must be left alone —
+  // over-escaping would stop a real filename from matching at all.
+  assertEquals(escapeFilterPattern("take(final).wav"), "take(final).wav");
+});
+
+Deno.test("a per-object failure is read from the JSON, since rclone exits 0", () => {
+  const out = `[
+{ "Status": "operation error S3: RestoreObject, api error RestoreAlreadyInProgress: Object restore is already in progress", "Remote": "kick.wav" }
+]`;
+  const rows = parseRestoreStatus(out);
+  assertEquals(rows.length, 1);
+  assert(isRestoreAlreadyInProgress(rows[0].status));
+});
+
+Deno.test("a genuine per-object error is not mistaken for the in-progress case", () => {
+  const rows = parseRestoreStatus(
+    `[{ "Status": "operation error S3: RestoreObject, api error AccessDenied", "Remote": "x" }]`,
+  );
+  assertEquals(rows.length, 1);
+  assert(!isRestoreAlreadyInProgress(rows[0].status));
+  assert(rows[0].status !== "OK");
+});
+
+Deno.test("a filter that matched nothing parses as zero rows, not as success", () => {
+  // rclone exits 0 here, so the empty array IS the failure signal.
+  assertEquals(parseRestoreStatus("[]").length, 0);
+  assertEquals(parseRestoreStatus("").length, 0);
+  assertEquals(parseRestoreStatus("not json at all").length, 0);
+});
+
+Deno.test("leading notices before the JSON do not defeat the parser", () => {
+  const out = `2026/08/15 23:11:57 NOTICE: Config file not found - using defaults
+[
+{ "Status": "OK", "Remote": "kick.wav" }
+]`;
+  const rows = parseRestoreStatus(out);
+  assertEquals(rows.length, 1);
+  assertEquals(rows[0].status, "OK");
 });
