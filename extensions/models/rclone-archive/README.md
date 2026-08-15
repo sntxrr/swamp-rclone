@@ -89,16 +89,48 @@ large file here) that ETag is not an MD5 of the content, so comparing it
 compares noise. `verify` therefore compares object count and byte totals, and
 `restoreDrill` is the only rung that can prove integrity.
 
-## Not yet implemented
+## Packing
 
-The `pack` strategy. `scan` will choose it for small-file shares — below roughly
-1 MB mean file size, Deep Archive's 40 KB per-object overhead stops being a
-rounding error — and records the reason.
+`scan` chooses `pack` for shares below roughly 1 MB mean file size, where Deep
+Archive's 40 KB per-object overhead stops being a rounding error.
 
-`push` **refuses** to run in pack mode rather than performing a direct copy
-while labelling the result a pack. A transfer resource that misreports its own
-strategy makes every downstream cost projection wrong, and the error surfaces
-only as an unexplained bill.
+```bash
+swamp model @sntxrr/rclone-archive method run push archive-homes \
+  --input strategy=pack --input dryRun=true
+```
+
+**Pack boundaries are one-per-top-level-entry and never size-grouped.** Grouping
+would make object names a function of the data: add a file, the grouping shifts,
+every pack is renamed, and the next push re-uploads the share while paying a
+fresh 180-day minimum on each replaced object. `homes` gives one pack per user,
+`time-machine` one per sparsebundle, `docker` one per container — which is also
+the granularity you would actually want to restore at.
+
+Loose files in the share root are collected into a single `_root.tar` so they
+are neither skipped nor turned into one object each.
+
+Existing packs are **skipped**, not replaced. Pass `--input repack=true` to
+replace one deliberately — on Deep Archive a replacement deletes the old object
+and bills its remaining 180-day minimum anyway, so re-packing an unchanged
+subtree pays twice for the same bytes.
+
+### Drilling a pack
+
+Hashing a whole pack proves it downloaded. It does **not** prove it opens. Pass
+`member` and the drill unpacks in flight and hashes just that file:
+
+```bash
+swamp model @sntxrr/rclone-archive method run restoreDrill archive-homes \
+  --input objectPath=don.tar \
+  --input member=don/Documents/notes.txt \
+  --input sourceSha256=<sha>
+```
+
+Both the pack and extract scripts set `pipefail`, and neither is optional. In
+the pack direction, a tar that dies halfway would otherwise exit 0 and store a
+truncated object as complete. In the extract direction, a member that is not in
+the archive would otherwise let `sha256sum` exit 0 having hashed an empty
+stream — a green drill for data that is not there.
 
 ## Testing
 
@@ -106,12 +138,16 @@ only as an unexplained bill.
 ~/.swamp/deno/deno test --allow-all extensions/models/rclone-archive/rclone_archive_test.ts
 ```
 
-55 tests. The suite mocks the `ssh` boundary only — `shQuote`, the remote
+71 tests. The suite mocks the `ssh` boundary only — `shQuote`, the remote
 command line, storage-class injection, env-file assembly and all parsing
 execute for real, because `shQuote` is the most security-relevant function here
 and stubbing it would test nothing.
 
-Every guard is mutation-verified: deleting the forbidden-subcommand set, the
-storage-class injection, the argv secret scan, the env-file newline rejection,
-the restore byte ceiling, the pack-mislabel refusal, or `shQuote` itself each
-makes the suite fail.
+All 13 guards are mutation-verified — each is deleted in turn and the suite must
+fail: `shQuote`, the forbidden-subcommand set, storage-class injection, the
+shell-entrypoint storage-class assertion, the credentials-based exemption for
+source-only calls, the argv secret scan, the env-file newline rejection, the
+restore byte ceiling, `pipefail` in both the pack and extract scripts, the
+skip-existing pack guard, and pack-plan determinism.
+
+A green suite proves nothing until a mutation is shown to break it.

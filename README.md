@@ -85,13 +85,36 @@ docker `--env-file` read from the SSH stdin pipe; see
 [`CONVENTIONS.md`](./CONVENTIONS.md) §6 for why the obvious `docker run -e …`
 spelling is wrong.
 
+## Packing
+
+Shares whose mean file size falls below ~1 MB are archived as tar streams
+rather than object-per-file, because Deep Archive bills 40 KB of overhead per
+object no matter how small the file.
+
+**One pack per top-level entry, with no size-based grouping.** That deliberately
+ignores the target pack size, and it is the most important decision in the
+design: grouping small directories toward a target makes pack boundaries a
+function of the *data*, so adding one file reshuffles the grouping, every
+downstream pack gets a new name, and the next push re-uploads the whole share —
+paying a fresh 180-day minimum on every object it replaced. Stable names are
+worth more than optimal packing, because an archive is written far more often
+than it is read.
+
+tar streams straight into `rclone rcat`, so nothing is staged on the NAS —
+volume1 is 53% full and a 400 GB temporary tar would not fit. `set -o pipefail`
+is what makes that trustworthy: without it a tar that dies halfway still exits
+0, and rclone faithfully stores the truncated stream as a complete object.
+
+A pack whose object already exists is **skipped**, not replaced; `--input
+repack=true` opts into replacement.
+
 ## Status
 
-**Wave 1.** `scan`, `push` (direct), `verify`, `restoreRequest` and
-`restoreDrill` are implemented, with 55 tests and every guard mutation-verified.
+Complete: `scan`, `push` (direct **and** pack), `verify`, `restoreRequest` and
+`restoreDrill` (including single-member extraction from a pack, which is what
+proves the packing is reversible).
 
-**Not yet implemented:** the `pack` strategy (PRD §4.1). `scan` will *choose*
-pack for small-file shares and record why, and `push` **refuses** to run in that
-mode rather than silently performing a direct copy while labelling the result a
-pack — a transfer resource that misreports its own strategy would make every
-downstream cost projection wrong.
+71 tests, and all 13 guards mutation-verified.
+
+**Not yet done:** live verification against the NAS, and the swamp workflow that
+sequences the ladder across shares on a schedule.

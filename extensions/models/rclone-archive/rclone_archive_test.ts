@@ -15,8 +15,12 @@ import {
   model,
   normalisePrefix,
   OBJECT_OVERHEAD_BYTES,
+  parseDu,
   parseSize,
   projectCost,
+  buildPackPlan,
+  buildPackScript,
+  buildExtractScript,
   RCLONE_EXIT,
   type RcloneResult,
   redactSecrets,
@@ -519,15 +523,200 @@ Deno.test("push copies and never syncs", async () => {
   }
 });
 
-Deno.test("push refuses pack rather than mislabelling a direct copy", async () => {
-  const ssh = await fakeSsh("exit 0");
-  const { context } = testContext(baseArgs(ssh.path));
+// ---------------------------------------------------------------------------
+// Packing
+// ---------------------------------------------------------------------------
+
+Deno.test("parseDu splits on the first tab, not on whitespace", () => {
+  // volume1 really does contain directory names with spaces.
+  const out = parseDu("12\t/data/Resilio Sync\n4096\t/data/homes\n");
+  assertEquals(out, [
+    { name: "Resilio Sync", bytes: 12 * 1024 },
+    { name: "homes", bytes: 4096 * 1024 },
+  ]);
+});
+
+Deno.test("parseDu ignores lines that are not du output", () => {
+  assertEquals(parseDu("du: cannot read\n\nrubbish\n"), []);
+});
+
+Deno.test("a pack plan is one pack per top-level entry, sorted", () => {
+  const plan = buildPackPlan(
+    [
+      { name: "zeta", bytes: 3 },
+      { name: "alpha", bytes: 1 },
+      { name: "mid", bytes: 2 },
+    ],
+    0,
+  );
+  assertEquals(plan.map((p) => p.name), ["alpha", "mid", "zeta"]);
+  assertEquals(plan.map((p) => p.member), ["alpha", "mid", "zeta"]);
+});
+
+Deno.test("pack boundaries do NOT shift when a directory grows", () => {
+  // The whole point of refusing size-based grouping: an archive whose object
+  // names move when data changes re-uploads everything and pays a fresh
+  // 180-day minimum on each replaced object.
+  const before = buildPackPlan(
+    [{ name: "a", bytes: 10 }, { name: "b", bytes: 10 }, { name: "c", bytes: 10 }],
+    0,
+  );
+  const after = buildPackPlan(
+    [
+      { name: "a", bytes: 10 },
+      { name: "b", bytes: 900_000_000_000 },
+      { name: "c", bytes: 10 },
+    ],
+    0,
+  );
+  assertEquals(before.map((p) => p.name), after.map((p) => p.name));
+});
+
+Deno.test("loose files in the share root become a single _root pack", () => {
+  const plan = buildPackPlan([{ name: "homes", bytes: 5 }], 1234);
+  assertEquals(plan.length, 2);
+  const root = plan.find((p) => p.name === "_root");
+  assert(root, "_root pack must exist when loose files are present");
+  assertEquals(root?.member, ".");
+});
+
+Deno.test("no _root pack is created when the share root has no loose files", () => {
+  assertEquals(buildPackPlan([{ name: "homes", bytes: 5 }], 0).length, 1);
+});
+
+Deno.test("the pack script sets pipefail — without it a broken tar uploads truncated", () => {
+  const script = buildPackScript("homes", "dest:b/x/homes.tar", "GLACIER_DEEP_ARCHIVE");
+  assertStringIncludes(script, "set -o pipefail");
+  // Without pipefail the exit status is rclone's alone, so a tar that dies
+  // halfway still exits 0 and the truncated stream is stored as complete.
+  assertStringIncludes(script, "tar -C /data -cf -");
+  assertStringIncludes(script, "rclone rcat");
+  assertStringIncludes(script, "--s3-storage-class");
+});
+
+Deno.test("the pack script quotes a member name containing a space", () => {
+  const script = buildPackScript("Resilio Sync", "dest:b/x/a.tar", "GLACIER");
+  assertStringIncludes(script, `'Resilio Sync'`);
+});
+
+Deno.test("a shell-entrypoint write without the storage class is refused", async () => {
+  // Appending the flag here would make it a positional parameter of `sh`,
+  // which rclone never sees — the silent 23x mistake wearing the guard's
+  // own clothes.
+  await assertRejects(
+    () =>
+      runRclone(CREDS, DEST, {
+        sshHost: "nas.example.invalid",
+        sshBinary: "/bin/false",
+        sourceMount: "/volume1/homes",
+        entrypoint: "sh",
+      }, ["-c", "tar -cf - . | rclone rcat dest:b/x.tar"]),
+    Error,
+    "silently land at S3 Standard rates",
+  );
+});
+
+Deno.test("a source-only shell invocation needs no storage class", async () => {
+  // No credentials means rclone cannot reach S3 at all, so there is no class
+  // to name. The exemption keys on credentials, not on a caller's assertion.
+  const ssh = await fakeSsh(`echo '4\t/data/homes'`);
   try {
-    await assertRejects(
-      () => model.methods.push.execute({ strategy: "pack" }, context),
-      Error,
-      "wave 2",
+    const r = await runRclone(
+      { accessKeyId: "", secretAccessKey: "" },
+      DEST,
+      {
+        sshHost: "nas.example.invalid",
+        sshBinary: ssh.path,
+        sourceMount: "/volume1/homes",
+        entrypoint: "sh",
+      },
+      ["-c", "du -sk /data/*"],
     );
+    assertEquals(r.code, 0);
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("push in pack mode skips packs whose object already exists", async () => {
+  // du lists one entry; lsjson then reports the object present.
+  const ssh = await fakeSsh(
+    `case "$*" in
+  *"du -sk"*) echo '4\t/data/homes'; echo '0\t/data/.' ;;
+  *lsjson*) echo '[{"Path":"homes.tar","Size":1}]' ;;
+  *) exit 0 ;;
+esac`,
+  );
+  const { written, context } = testContext(baseArgs(ssh.path, { strategy: "pack" }));
+  try {
+    await model.methods.push.execute({}, context);
+    const d = written[0].data as Record<string, unknown>;
+    assertEquals(d.strategy, "pack");
+    assertEquals(d.packsPlanned, 1);
+    assertEquals(d.packsSkipped, 1);
+    assertEquals(d.packsUploaded, 0);
+    assertEquals(d.passed, true);
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("push in pack mode uploads a pack that does not yet exist", async () => {
+  const ssh = await fakeSsh(
+    `case "$*" in
+  *"du -sk"*) echo '4\t/data/homes'; echo '0\t/data/.' ;;
+  *lsjson*) echo '[]' ;;
+  *) exit 0 ;;
+esac`,
+  );
+  const { written, context } = testContext(baseArgs(ssh.path, { strategy: "pack" }));
+  try {
+    await model.methods.push.execute({}, context);
+    const d = written[0].data as Record<string, unknown>;
+    assertEquals(d.packsUploaded, 1);
+    assertEquals(d.packsSkipped, 0);
+    assertEquals(d.passed, true);
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("push in pack mode records which packs failed, not just that one did", async () => {
+  const ssh = await fakeSsh(
+    `case "$*" in
+  *"du -sk"*) echo '4\t/data/homes'; echo '0\t/data/.' ;;
+  *lsjson*) echo '[]' ;;
+  *) echo "tar: read error" >&2; exit 2 ;;
+esac`,
+  );
+  const { written, context } = testContext(baseArgs(ssh.path, { strategy: "pack" }));
+  try {
+    await model.methods.push.execute({}, context);
+    const d = written[0].data as Record<string, unknown>;
+    assertEquals(d.passed, false);
+    assertEquals(d.packsFailed, 1);
+    assertEquals(d.failedPacks, ["homes"]);
+    assertEquals(d.failureReason, "pack-failed");
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("push in pack dry-run mode uploads nothing", async () => {
+  const ssh = await fakeSsh(
+    `case "$*" in
+  *"du -sk"*) echo '4\t/data/homes'; echo '0\t/data/.' ;;
+  *lsjson*) echo '[]' ;;
+  *rcat*) echo "SHOULD NOT RUN" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac`,
+  );
+  const { written, context } = testContext(baseArgs(ssh.path, { strategy: "pack" }));
+  try {
+    await model.methods.push.execute({ dryRun: true }, context);
+    const d = written[0].data as Record<string, unknown>;
+    assertEquals(d.dryRun, true);
+    assertEquals(d.passed, true);
   } finally {
     ssh.cleanup();
   }
@@ -617,6 +806,62 @@ Deno.test("restoreDrill reports a still-retrieving object as pending", async () 
     await model.methods.restoreDrill.execute({ objectPath: "a/b.tar" }, context);
     assertEquals(written[0].data.phase, "pending");
     assertEquals(written[0].data.passed, false);
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("the extract script sets pipefail — a missing member must not hash empty", () => {
+  const s = buildExtractScript("dest:b/x/homes.tar", "homes/don/notes.txt", "GLACIER");
+  assertStringIncludes(s, "set -o pipefail");
+  // Without pipefail, tar failing on a missing member still lets sha256sum
+  // exit 0 having hashed nothing — a green drill for absent data.
+  assertStringIncludes(s, "tar -xOf -");
+  assertStringIncludes(s, "sha256sum");
+  assertStringIncludes(s, `'homes/don/notes.txt'`);
+});
+
+Deno.test("restoreDrill on a pack extracts one member, proving it unpacks", async () => {
+  const ssh = await fakeSsh(
+    `case "$*" in
+  *"size"*) echo '{"count":1,"bytes":100}' ;;
+  *) echo "deadbeef  -" ;;
+esac`,
+  );
+  const { written, context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.restoreDrill.execute(
+      { objectPath: "homes.tar", member: "homes/don/notes.txt", sourceSha256: "deadbeef" },
+      context,
+    );
+    const d = written[0].data as Record<string, unknown>;
+    assertEquals(d.phase, "restored");
+    assertEquals(d.contentMatched, true);
+    assertEquals(d.passed, true);
+    // The extraction must actually have gone through tar, not hashed the pack.
+    assertStringIncludes(ssh.argv().at(-1) ?? "", "tar -xOf -");
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("restoreDrill fails loudly on a content mismatch", async () => {
+  const ssh = await fakeSsh(
+    `case "$*" in
+  *"size"*) echo '{"count":1,"bytes":100}' ;;
+  *) echo "0000000  -" ;;
+esac`,
+  );
+  const { written, context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.restoreDrill.execute(
+      { objectPath: "a.tar", sourceSha256: "deadbeef" },
+      context,
+    );
+    const d = written[0].data as Record<string, unknown>;
+    assertEquals(d.contentMatched, false);
+    assertEquals(d.passed, false);
+    assertEquals(d.failureReason, "content-mismatch");
   } finally {
     ssh.cleanup();
   }

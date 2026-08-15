@@ -172,9 +172,40 @@ export async function runRclone(
     }
   }
 
-  const argv = args.includes("--s3-storage-class")
-    ? args
-    : [...args, "--s3-storage-class", dest.storageClass];
+  // The storage-class invariant, enforced two different ways because the two
+  // invocation shapes fail differently.
+  //
+  // Normally `args` is an rclone argv and the flag can simply be appended. But
+  // packing runs `sh -c '<script>'`, where `args` is ["-c", script]: appending
+  // a flag there makes it a POSITIONAL PARAMETER of the shell, which rclone
+  // never sees. The upload would then land at S3 Standard rates while the code
+  // looked like it had injected the class — the exact silent 23x mistake the
+  // guard exists to prevent, wearing the guard's own clothes. So assert.
+  //
+  // Both forms apply only when the invocation actually CARRIES credentials.
+  // Without them rclone cannot reach S3 at all, so a source-only call — the
+  // `du` tree walk that plans a pack, or `size /data` — has no storage class
+  // to name. Keying on credentials rather than on a caller-supplied "read
+  // only" flag means the exemption cannot be claimed by an invocation that
+  // could in fact write.
+  let argv: string[];
+  if (secrets.length === 0) {
+    argv = args;
+  } else if (transport.entrypoint) {
+    if (!args.join(" ").includes("--s3-storage-class")) {
+      throw new Error(
+        "refusing to run: a shell-entrypoint invocation must name " +
+          "--s3-storage-class inside the script itself. Appending it here " +
+          "would pass it to the shell, not to rclone, and the upload would " +
+          "silently land at S3 Standard rates.",
+      );
+    }
+    argv = args;
+  } else {
+    argv = args.includes("--s3-storage-class")
+      ? args
+      : [...args, "--s3-storage-class", dest.storageClass];
+  }
 
   // The remote command line. Every word is quoted because ssh hands this to a
   // login shell, and volume1 contains paths with spaces and parentheses.
@@ -393,6 +424,129 @@ export function churnFraction(
   return Math.abs(currentBytes - previousBytes) / previousBytes;
 }
 
+/** One tar object to be produced from the share. */
+export interface Pack {
+  /** Object name at the destination, without the .tar suffix. */
+  name: string;
+  /**
+   * Path relative to the share root that tar will archive, or "." for the
+   * loose files sitting directly in the share root.
+   */
+  member: string;
+  bytes: number;
+}
+
+/**
+ * Parse `du -sk /data/*` output into entries relative to the share root.
+ *
+ * busybox `du` emits "<kilobytes>\t<path>". Splitting on the FIRST tab matters:
+ * a directory name may contain a tab, and splitting on whitespace would break
+ * every directory name containing a space — of which volume1 has several.
+ */
+export function parseDu(
+  stdout: string,
+): Array<{ name: string; bytes: number }> {
+  const out: Array<{ name: string; bytes: number }> = [];
+  for (const line of stdout.split("\n")) {
+    const tab = line.indexOf("\t");
+    if (tab === -1) continue;
+    const kb = Number(line.slice(0, tab).trim());
+    const path = line.slice(tab + 1);
+    if (!Number.isFinite(kb) || path.length === 0) continue;
+    // Entries arrive as /data/<name>; keep only the leaf.
+    const name = path.replace(/^\/data\/?/, "");
+    if (name.length === 0 || name === ".") continue;
+    out.push({ name, bytes: kb * 1024 });
+  }
+  return out;
+}
+
+/**
+ * Turn a share's top-level entries into a stable set of packs.
+ *
+ * **One pack per top-level entry, with no size-based grouping.** That looks
+ * wasteful — it ignores packTargetBytes, and a share of many tiny directories
+ * produces many small objects — but the alternative is worse in the way that
+ * matters for an archive.
+ *
+ * Grouping small directories toward a target size makes pack boundaries a
+ * function of the DATA. Add one file and the grouping shifts, every downstream
+ * pack gets a different name, and the next push re-uploads the entire share —
+ * paying, on Glacier Deep Archive, a fresh 180-day minimum on every object it
+ * replaced. Stable names are worth more than optimal packing, because an
+ * archive is written far more often than it is read.
+ *
+ * Loose files in the share root are collected into a single `_root` pack so
+ * they are neither skipped nor turned into one object each.
+ */
+export function buildPackPlan(
+  entries: Array<{ name: string; bytes: number }>,
+  looseFileBytes: number,
+): Pack[] {
+  const packs: Pack[] = entries
+    .filter((e) => e.name !== ".")
+    .map((e) => ({ name: e.name, member: e.name, bytes: e.bytes }))
+    // Sort for deterministic ordering — a plan that varies run to run is a
+    // plan that cannot be compared against the previous run.
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  if (looseFileBytes > 0) {
+    packs.push({ name: "_root", member: ".", bytes: looseFileBytes });
+  }
+  return packs;
+}
+
+/**
+ * Build the shell script that streams one subtree to one Deep Archive object.
+ *
+ * tar writes to stdout and `rclone rcat` reads stdin, so the whole pack is
+ * streamed — nothing is staged on the NAS, which matters because volume1 is
+ * 53% full and a 400 GB temporary tar would not fit.
+ *
+ * `set -o pipefail` is not optional. Without it the exit status is rclone's
+ * alone, so a tar that dies halfway — disk error, permission denied, file
+ * vanishing mid-read — still exits 0, and rclone faithfully uploads the
+ * truncated stream as a complete object. That is the worst failure mode
+ * available here: a backup that reports success and cannot be restored.
+ */
+export function buildPackScript(
+  member: string,
+  destination: string,
+  storageClass: string,
+): string {
+  return [
+    "set -e",
+    "set -o pipefail",
+    `tar -C /data -cf - ${shQuote(member)} | rclone rcat ` +
+    `${shQuote(destination)} --s3-storage-class ${shQuote(storageClass)}`,
+  ].join("\n");
+}
+
+/**
+ * Build the shell script that extracts ONE member from a packed object and
+ * hashes it.
+ *
+ * `tar -xO` writes the member to stdout, so nothing is staged on the NAS. As
+ * with the pack script, `pipefail` is what makes the result trustworthy: a
+ * missing member makes tar fail, and without pipefail `sha256sum` would still
+ * exit 0 having hashed an empty stream — reporting a successful drill for a
+ * member that is not in the archive.
+ */
+export function buildExtractScript(
+  object: string,
+  member: string,
+  storageClass: string,
+): string {
+  return [
+    "set -e",
+    "set -o pipefail",
+    `rclone cat ${shQuote(object)} --s3-storage-class ${
+      shQuote(storageClass)
+    } ` +
+    `| tar -xOf - ${shQuote(member)} | sha256sum`,
+  ].join("\n");
+}
+
 /** Strip a leading/trailing slash so prefixes concatenate predictably. */
 export function normalisePrefix(prefix: string): string {
   return prefix.replace(/^\/+/, "").replace(/\/+$/, "");
@@ -485,6 +639,15 @@ const TransferSchema = z.object({
   exitCode: z.number(),
 
   storageClass: z.string(),
+
+  /** Packs attempted, uploaded, and skipped because the object already exists. */
+  packsPlanned: z.number(),
+  packsUploaded: z.number(),
+  packsSkipped: z.number(),
+  packsFailed: z.number(),
+  /** Names of packs that failed, for a targeted retry. */
+  failedPacks: z.array(z.string()),
+
   ranAt: z.string(),
   durationMs: z.number(),
 });
@@ -628,6 +791,12 @@ const PushArgsSchema = z.object({
     "Stop after this many bytes (--max-transfer). Exit 8 is recorded as " +
       "inconclusive, not as a failure.",
   ),
+  repack: z.boolean().optional().describe(
+    "Pack strategy only. Replace packs whose object already exists. Off by " +
+      "default: on Deep Archive a replacement deletes the old object and " +
+      "bills its remaining 180-day minimum anyway, so re-packing an " +
+      "unchanged subtree pays twice for the same bytes.",
+  ),
 });
 
 const VerifyArgsSchema = z.object({});
@@ -652,6 +821,12 @@ const RestoreDrillArgsSchema = z.object({
   sourceSha256: z.string().optional().describe(
     "Expected SHA-256. If given, the drill fails unless the retrieved " +
       "content matches — the only rung that proves integrity.",
+  ),
+  member: z.string().optional().describe(
+    "Packed shares only. Extract this single member from the tar and hash " +
+      "it, rather than hashing the whole pack. Proves the packing is " +
+      "REVERSIBLE — a pack that downloads intact but cannot be unpacked is " +
+      "not a backup, and hashing the tar as a whole would never notice.",
   ),
 });
 
@@ -709,6 +884,152 @@ export function classifyFailure(result: RcloneResult): string {
     default:
       return `exit-${result.code}`;
   }
+}
+
+/**
+ * The pack path of `push`.
+ *
+ * Streams one tar per top-level entry straight into a Deep Archive object.
+ * Nothing is staged on the NAS: volume1 is 53% full and a 400 GB temporary tar
+ * would not fit, so tar's stdout is piped directly into `rclone rcat`.
+ *
+ * A pack whose object already exists is SKIPPED rather than replaced. On Deep
+ * Archive a replacement deletes the old object and bills its remaining 180-day
+ * minimum anyway, so silently re-packing an unchanged subtree is a way to pay
+ * twice for the same bytes. `repack` opts into replacement explicitly.
+ */
+async function pushPacked(
+  args: z.infer<typeof PushArgsSchema>,
+  context: ExecuteContext<GlobalArgs>,
+  started: number,
+): Promise<Handles> {
+  const g = context.globalArgs;
+  const share = g.shareName;
+  const dryRun = args.dryRun ?? false;
+  const repack = args.repack ?? false;
+  const dest = destPath(g.bucket, g.destPrefix ?? "", share);
+  const storageClass = g.storageClass ?? "GLACIER_DEEP_ARCHIVE";
+  const creds = credentialsOf(g);
+  const destination = destinationOf(g);
+  const transport = transportOf(g);
+
+  // One tree walk for every top-level entry's size, plus the loose files at
+  // the share root. `du -sk` is used rather than N× `rclone size` because the
+  // latter would walk the whole share once per subdirectory.
+  const duRun = await runRclone(
+    NO_CREDENTIALS,
+    destination,
+    { ...transport, entrypoint: "sh" },
+    [
+      "-c",
+      "set -e\ndu -sk /data/* 2>/dev/null || true\n" +
+      'echo "$(find /data -maxdepth 1 -type f -exec du -k {} + 2>/dev/null | ' +
+      "awk '{s+=$1} END {print s+0}')\t/data/.\"",
+    ],
+  );
+
+  const entries = parseDu(duRun.stdout);
+  const loose = entries.find((e) => e.name === "." || e.name === "");
+  const plan = buildPackPlan(
+    entries.filter((e) => e.name !== "." && e.name !== ""),
+    loose?.bytes ?? 0,
+  );
+
+  if (duRun.code !== RCLONE_EXIT.OK && plan.length === 0) {
+    const handle = await context.writeResource("transfer", share, {
+      shareName: share,
+      destination: dest,
+      strategy: "pack",
+      dryRun,
+      passed: false,
+      inconclusive: isInconclusive(duRun),
+      nothingToTransfer: false,
+      failureReason: classifyFailure(duRun),
+      detail: duRun.stderr.slice(0, 2000) || null,
+      exitCode: duRun.code,
+      storageClass,
+      packsPlanned: 0,
+      packsUploaded: 0,
+      packsSkipped: 0,
+      packsFailed: 0,
+      failedPacks: [],
+      ranAt: new Date().toISOString(),
+      durationMs: Date.now() - started,
+    });
+    return { dataHandles: [handle] };
+  }
+
+  let uploaded = 0;
+  let skipped = 0;
+  const failed: string[] = [];
+  let lastCode: number = RCLONE_EXIT.OK;
+  let lastDetail = "";
+
+  for (const pack of plan) {
+    const object = `${dest}/${pack.name}.tar`;
+
+    if (!repack) {
+      const exists = await runRclone(creds, destination, transport, [
+        "lsjson",
+        object,
+      ]);
+      // lsjson exits 0 with a non-empty array when the object is present.
+      if (exists.code === RCLONE_EXIT.OK && exists.stdout.includes('"Path"')) {
+        skipped++;
+        continue;
+      }
+    }
+
+    if (dryRun) {
+      context.logger.info(
+        `${share}: would pack ${pack.member} -> ${pack.name}.tar ` +
+          `(${(pack.bytes / 1e9).toFixed(2)} GB)`,
+      );
+      uploaded++;
+      continue;
+    }
+
+    const run = await runRclone(
+      creds,
+      destination,
+      { ...transport, entrypoint: "sh" },
+      ["-c", buildPackScript(pack.member, object, storageClass)],
+    );
+
+    if (run.code === RCLONE_EXIT.OK) {
+      uploaded++;
+    } else {
+      failed.push(pack.name);
+      lastCode = run.code;
+      lastDetail = run.stderr.slice(0, 2000);
+      context.logger.warn(
+        `${share}: pack ${pack.name} failed (${classifyFailure(run)})`,
+      );
+    }
+  }
+
+  const passed = failed.length === 0;
+  const handle = await context.writeResource("transfer", share, {
+    shareName: share,
+    destination: dest,
+    strategy: "pack",
+    dryRun,
+    passed,
+    inconclusive: false,
+    nothingToTransfer: uploaded === 0 && skipped > 0,
+    failureReason: passed ? null : "pack-failed",
+    detail: passed ? null : lastDetail || null,
+    exitCode: passed ? RCLONE_EXIT.OK : lastCode,
+    storageClass,
+    packsPlanned: plan.length,
+    packsUploaded: uploaded,
+    packsSkipped: skipped,
+    packsFailed: failed.length,
+    failedPacks: failed,
+    ranAt: new Date().toISOString(),
+    durationMs: Date.now() - started,
+  });
+  return { dataHandles: [handle] };
 }
 
 // ---------------------------------------------------------------------------
@@ -994,18 +1315,8 @@ export const model = {
         const dest = destPath(g.bucket, g.destPrefix ?? "", share);
         const storageClass = g.storageClass ?? "GLACIER_DEEP_ARCHIVE";
 
-        // Refuse rather than silently copy object-per-file while recording
-        // strategy: "pack". A transfer resource that misreports its own
-        // strategy would make every downstream cost projection wrong, and the
-        // error would only surface as an unexplained bill.
         if (strategy === "pack") {
-          throw new Error(
-            `push does not yet implement the pack strategy (PRD §4.1); it is ` +
-              `wave 2. Scanning chose pack for "${share}" because its mean ` +
-              `file size makes per-object overhead material. Either run with ` +
-              `--input strategy=direct, accepting that overhead, or wait for ` +
-              `packing rather than have this record a pack that did not happen.`,
-          );
+          return await pushPacked(args, context, started);
         }
 
         const flags = [
@@ -1054,6 +1365,11 @@ export const model = {
           detail: run.stderr.slice(0, 2000) || null,
           exitCode: run.code,
           storageClass,
+          packsPlanned: 0,
+          packsUploaded: 0,
+          packsSkipped: 0,
+          packsFailed: 0,
+          failedPacks: [],
           ranAt: new Date().toISOString(),
           durationMs: Date.now() - started,
         });
@@ -1294,15 +1610,28 @@ export const model = {
           );
         }
 
-        // sha256sum streams the restored object without landing it on disk.
+        // Both forms stream the restored object without landing it on disk.
         // Deep Archive returns InvalidObjectState until the retrieval
         // completes, which is a pending signal rather than a failure.
-        const hashRun = await runRclone(
-          credentialsOf(g),
-          destinationOf(g),
-          transportOf(g),
-          ["sha256sum", object],
-        );
+        //
+        // With `member`, the pack is unpacked in flight and only that member
+        // is hashed — the difference between "the object came back" and "the
+        // archive can actually be opened", which is the whole point of a drill
+        // against a packed share.
+        const storageClass = g.storageClass ?? "GLACIER_DEEP_ARCHIVE";
+        const hashRun = args.member
+          ? await runRclone(
+            credentialsOf(g),
+            destinationOf(g),
+            { ...transportOf(g), entrypoint: "sh" },
+            ["-c", buildExtractScript(object, args.member, storageClass)],
+          )
+          : await runRclone(
+            credentialsOf(g),
+            destinationOf(g),
+            transportOf(g),
+            ["sha256sum", object],
+          );
 
         const pending = /InvalidObjectState|not restored|storage class/i.test(
           hashRun.stderr,
