@@ -40,6 +40,9 @@ this suite is what protects it.**
 Archive, on a schedule, driven from the existing `swamp serve` instance on the
 `docker` host, with credentials from 1Password Connect.
 
+**Also in:** metric emission, so the ladder is observable in the existing
+Prometheus/Grafana stack rather than only in `swamp data query` (§6).
+
 **Out:**
 
 - Restoring the NAS. This suite proves a restore is *possible* and drills it on
@@ -48,6 +51,8 @@ Archive, on a schedule, driven from the existing `swamp serve` instance on the
   `@swamp/aws/s3` territory; this suite consumes a bucket it did not create.
 - Replacing restic. The two coexist: restic covers the Linux fleet to B2, this
   covers the NAS to Glacier.
+- **The initial seed.** Moving the first 13.8 TB is explicitly *not* a swamp
+  method (§5.1). swamp owns the steady state; the seed is an operator job.
 
 ### 2.1 Scope decision, recorded
 
@@ -162,6 +167,65 @@ swamp serve (docker host)
 
 No rclone binary is installed on DSM — there is no Entware on this box and a
 package installed by hand does not survive a DSM upgrade. A container does.
+
+### 5.1 The seed is not a swamp method
+
+The first full copy is out of scope for swamp, for a reason that is structural
+rather than stylistic: **a swamp method has a 6-hour default timeout, and the
+seed cannot finish inside one.** At 100 Mbps of saturated upload, 13.8 TB takes
+roughly 13 days; even a gigabit symmetric link needs more than a day. There is
+no cadence at which a single `push` invocation completes it, and a push that ran
+for days would hold the per-model lock for days, blocking every other rung.
+
+So the seed runs as an operator job under [`herdr`](https://herdr.dev), which
+already manages long-lived sessions on this fleet — a named persistent session
+on the NAS, attachable from a workstation, surviving disconnection. `rclone
+copy` is resumable (it skips what already exists), so an interrupted seed is
+continued rather than restarted.
+
+**The seed must use the same flags the model would.** This is the one real
+hazard of stepping outside swamp: a hand-written command that omits
+`--s3-storage-class` lands 13.8 TB at S3 Standard rates — roughly $295/mo
+against $13 — and nothing in rclone's output says so. The seed command is
+therefore *generated* by `push --input dryRun=true`, which runs the real code
+path and prints the exact invocation, rather than transcribed from memory.
+
+Ingress to S3 is free, so the seed costs only PUT requests and storage. Those
+scale with object count, which is the strongest argument for packing the
+small-file shares before the seed rather than after: roughly $250 in PUTs at
+5M objects, against under a cent packed.
+
+## 6. Observability
+
+A rung that has never run is a finding (§4), and today that finding is only
+visible to someone who thinks to run `swamp data query`. Nobody thinks to. The
+suite therefore emits metrics to the Prometheus instance already running on the
+NAS, so the ladder is legible on a dashboard and — more usefully — alertable.
+
+**Alerting is where the ladder's design pays off.** The metrics worth having are
+mostly *timestamps of last success*, because the failure this suite exists to
+prevent is silence:
+
+| Metric | Alert it enables |
+| ------ | ---------------- |
+| `..._last_success_timestamp_seconds{share,rung}` | "no successful push in 25 h", "no restore drill in 40 days" |
+| `..._push_success{share}` | a failing share, distinguished from an inconclusive one |
+| `..._churn_fraction{share}` | churn climbing toward a 180-day-minimum cost problem |
+| `..._projected_cost_usd{share,kind}` | cost drift — **the detector for a wrong storage class**, visible within a day instead of on a bill a month later |
+| `..._source_bytes` / `..._dest_bytes{share}` | the archive falling behind the source |
+
+That fourth row is the one that matters most given how this suite can fail
+expensively: a storage-class mistake is currently invisible until AWS bills for
+it. A projected-cost line on a dashboard turns a month-long feedback loop into a
+same-day one.
+
+Emission is a **separate model**, not a feature of `rclone-archive` — the same
+split as [`@sntxrr/apprise-notify`](https://github.com/sntxrr/swamp-apprise),
+which exists so swamp learns about one notifier rather than about every service
+behind it. A metrics emitter is reusable by the restic and Backblaze suites,
+which have exactly the same "did the rung run" question and no answer either.
+
+Design and setup are in [`SETUP.md`](./SETUP.md) §8. Nothing here is built yet.
 
 This transport is the one genuinely new thing in the suite. `swamp-restic` runs
 its binary locally against a *remote* repository and needs no transport at all;

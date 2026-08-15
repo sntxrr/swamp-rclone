@@ -118,5 +118,12 @@ proves the packing is reversible).
 
 **Not yet done:** live verification against the NAS. Nothing here has run
 against real hardware, so treat every rclone and DSM behaviour it relies on as
-asserted rather than observed. [`SETUP.md`](./SETUP.md) covers the AWS side and
-[`workflows/`](./workflows/) has a scheduling template.
+asserted rather than observed.
+
+**Planned, not built:** metric emission to Prometheus, so a rung that has not
+run becomes an alert rather than something you have to remember to query —
+including a projected-cost line, which is the only same-day detector for a
+wrong storage class. See [`SETUP.md`](./SETUP.md) §8.
+
+[`SETUP.md`](./SETUP.md) also covers the AWS side and the out-of-band seed under
+herdr (§7); [`workflows/`](./workflows/) has scheduling templates.
