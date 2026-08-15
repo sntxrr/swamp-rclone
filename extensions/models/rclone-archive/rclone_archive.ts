@@ -1,0 +1,1350 @@
+import { z } from "npm:zod@4";
+
+// ---------------------------------------------------------------------------
+// Canonical rclone runner — CONVENTIONS.md §5. Copied byte-identical.
+// ---------------------------------------------------------------------------
+
+/** Exit codes rclone uses. See CONVENTIONS.md §4.1. */
+export const RCLONE_EXIT = {
+  OK: 0,
+  USAGE: 1,
+  UNCATEGORISED: 2,
+  DIR_NOT_FOUND: 3,
+  FILE_NOT_FOUND: 4,
+  TEMPORARY: 5,
+  LESS_SERIOUS: 6,
+  FATAL: 7,
+  TRANSFER_LIMIT: 8,
+  NO_TRANSFER: 9,
+  DURATION_LIMIT: 10,
+} as const;
+
+/** Subcommands that remove data. This suite never deletes. */
+const FORBIDDEN = new Set([
+  "sync",
+  "move",
+  "moveto",
+  "delete",
+  "deletefile",
+  "purge",
+  "rmdir",
+  "rmdirs",
+  "cleanup",
+]);
+
+/** Credentials for the destination. Never logged, never serialised. */
+export interface RcloneCredentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+}
+
+/** Where and how the binary runs. Contains no secrets. */
+export interface RcloneTransport {
+  /** SSH destination, e.g. "nas" or "sntxrr@nas". */
+  sshHost: string;
+  /** Path to docker on the remote host. DSM puts it in /usr/local/bin. */
+  dockerBinary?: string;
+  /** Pinned rclone image. Never `:latest` in a model definition. */
+  image?: string;
+  /** Absolute host path bind-mounted read-only at /data. */
+  sourceMount: string;
+  sshBinary?: string;
+  timeoutMs?: number;
+  /**
+   * Override the container entrypoint. Packing needs a shell so tar can be
+   * piped into `rclone rcat`; nothing else may use it.
+   */
+  entrypoint?: string;
+}
+
+/** Destination remote. `storageClass` is mandatory — see CONVENTIONS.md §4.2. */
+export interface RcloneDestination {
+  bucket: string;
+  region: string;
+  storageClass: string;
+  provider?: string;
+  endpoint?: string;
+}
+
+export interface RcloneResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+  timedOut: boolean;
+}
+
+/**
+ * POSIX single-quote escaping for one remote shell word.
+ *
+ * ssh does not preserve argv — it joins arguments and lets the remote login
+ * shell re-split them. Wrapping in single quotes makes every character literal
+ * except `'` itself, which is closed, escaped and reopened.
+ *
+ * This is not hypothetical: volume1 contains `/volume1/Resilio Sync` and
+ * parenthesised filenames, either of which breaks an unquoted remote command.
+ */
+export function shQuote(word: string): string {
+  return `'${word.replaceAll("'", `'\\''`)}'`;
+}
+
+/**
+ * Build the docker env-file body that carries credentials to the remote.
+ *
+ * docker's --env-file is deliberately dumb: it splits on the first `=`, does
+ * not process quotes, and cannot represent a newline in a value. A credential
+ * containing a newline would silently truncate — and truncated credentials
+ * fail as authentication errors, which read like the wrong key rather than a
+ * corrupted one. So reject them here instead.
+ *
+ * Empty credentials are omitted entirely rather than written as blanks: a
+ * source-only operation such as `scan` never needs them, and shipping a secret
+ * to a host that has no use for it is a leak with no upside.
+ */
+export function buildEnvFile(
+  creds: RcloneCredentials,
+  dest: RcloneDestination,
+): string {
+  const entries: Record<string, string> = {
+    RCLONE_CONFIG_DEST_TYPE: "s3",
+    RCLONE_CONFIG_DEST_PROVIDER: dest.provider ?? "AWS",
+    RCLONE_CONFIG_DEST_REGION: dest.region,
+    RCLONE_CONFIG_DEST_LOCATION_CONSTRAINT: dest.region,
+    RCLONE_CONFIG_DEST_STORAGE_CLASS: dest.storageClass,
+  };
+  if (creds.accessKeyId) {
+    entries.RCLONE_CONFIG_DEST_ACCESS_KEY_ID = creds.accessKeyId;
+  }
+  if (creds.secretAccessKey) {
+    entries.RCLONE_CONFIG_DEST_SECRET_ACCESS_KEY = creds.secretAccessKey;
+  }
+  if (dest.endpoint) entries.RCLONE_CONFIG_DEST_ENDPOINT = dest.endpoint;
+
+  for (const [key, value] of Object.entries(entries)) {
+    if (/[\r\n]/.test(value)) {
+      throw new Error(
+        `refusing to run: ${key} contains a newline, which docker --env-file ` +
+          `cannot represent and would silently truncate`,
+      );
+    }
+  }
+  return Object.entries(entries).map(([k, v]) => `${k}=${v}`).join("\n") + "\n";
+}
+
+/**
+ * Run rclone on the remote host, in a container, over SSH.
+ *
+ * Three invariants are enforced here rather than trusted to callers, because
+ * each fails invisibly and expensively:
+ *
+ *  - Destructive subcommands are refused. `sync` against a source that failed
+ *    to mount empties the destination, unrecoverably and still billed.
+ *  - Secrets never reach argv on EITHER host. They travel as an env-file
+ *    delivered on the SSH stdin pipe.
+ *  - The storage class is injected. Without it the upload silently lands at S3
+ *    Standard rates and nothing says so until the bill.
+ */
+export async function runRclone(
+  creds: RcloneCredentials,
+  dest: RcloneDestination,
+  transport: RcloneTransport,
+  args: string[],
+): Promise<RcloneResult> {
+  const subcommand = args.find((a) => !a.startsWith("-"));
+  if (subcommand && FORBIDDEN.has(subcommand)) {
+    throw new Error(
+      `rclone "${subcommand}" removes data and this suite never deletes; ` +
+        `see CONVENTIONS.md §3`,
+    );
+  }
+
+  const secrets = [creds.accessKeyId, creds.secretAccessKey].filter((s) =>
+    s.length > 0
+  );
+  for (const arg of args) {
+    for (const secret of secrets) {
+      if (arg.includes(secret)) {
+        throw new Error(
+          "refusing to run: a credential appeared in rclone arguments, " +
+            "which are world-readable via ps on BOTH hosts",
+        );
+      }
+    }
+  }
+
+  const argv = args.includes("--s3-storage-class")
+    ? args
+    : [...args, "--s3-storage-class", dest.storageClass];
+
+  // The remote command line. Every word is quoted because ssh hands this to a
+  // login shell, and volume1 contains paths with spaces and parentheses.
+  const remote = [
+    transport.dockerBinary ?? "/usr/local/bin/docker",
+    "run",
+    "--rm",
+    "--env-file",
+    "/dev/stdin",
+    "-v",
+    `${transport.sourceMount}:/data:ro`,
+    ...(transport.entrypoint ? ["--entrypoint", transport.entrypoint] : []),
+    transport.image ?? "rclone/rclone:1.75.0",
+    ...argv,
+  ].map(shQuote).join(" ");
+
+  const controller = new AbortController();
+  const timeoutMs = transport.timeoutMs ?? 6 * 60 * 60 * 1000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const started = Date.now();
+
+  try {
+    const command = new Deno.Command(transport.sshBinary ?? "ssh", {
+      args: [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        transport.sshHost,
+        remote,
+      ],
+      env: {
+        PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin:/usr/local/bin",
+        HOME: Deno.env.get("HOME") ?? "/home/swamp",
+      },
+      clearEnv: true,
+      stdin: "piped",
+      stdout: "piped",
+      stderr: "piped",
+      signal: controller.signal,
+    });
+
+    const child = command.spawn();
+    const writer = child.stdin.getWriter();
+    await writer.write(new TextEncoder().encode(buildEnvFile(creds, dest)));
+    await writer.close();
+
+    const output = await child.output();
+    const decoder = new TextDecoder();
+    return {
+      code: output.code,
+      stdout: decoder.decode(output.stdout),
+      stderr: redactSecrets(decoder.decode(output.stderr), secrets),
+      durationMs: Date.now() - started,
+      timedOut: false,
+    };
+  } catch (error) {
+    if (controller.signal.aborted) {
+      return {
+        code: RCLONE_EXIT.DURATION_LIMIT,
+        stdout: "",
+        stderr: `rclone timed out after ${timeoutMs}ms`,
+        durationMs: Date.now() - started,
+        timedOut: true,
+      };
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * rclone echoes remote configuration into error messages. Strip credentials
+ * before any stderr reaches a resource snapshot or a log line.
+ */
+export function redactSecrets(text: string, secrets: string[]): string {
+  let out = text;
+  for (const secret of secrets) {
+    if (secret.length > 0) out = out.replaceAll(secret, "[redacted]");
+  }
+  return out;
+}
+
+/**
+ * Was this outcome inconclusive rather than a genuine failure?
+ *
+ * A retry exhaustion, a transfer cap or a duration cap says nothing about
+ * whether the archive is healthy. Recording any of them as a failed rung
+ * reports a working backup as broken.
+ */
+export function isInconclusive(result: RcloneResult): boolean {
+  if (result.timedOut) return true;
+  return result.code === RCLONE_EXIT.TEMPORARY ||
+    result.code === RCLONE_EXIT.TRANSFER_LIMIT ||
+    result.code === RCLONE_EXIT.DURATION_LIMIT;
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+/** `rclone size --json` output. Both fields are always present. */
+const SizeOutputSchema = z.object({
+  count: z.number(),
+  bytes: z.number(),
+});
+
+/**
+ * Parse `rclone size --json`.
+ *
+ * rclone writes warnings to stdout ahead of the JSON on some backends, so
+ * locate the object rather than assuming the whole stream parses.
+ */
+export function parseSize(
+  stdout: string,
+): { count: number; bytes: number } | null {
+  const start = stdout.indexOf("{");
+  const end = stdout.lastIndexOf("}");
+  if (start === -1 || end === -1 || end < start) return null;
+  try {
+    return SizeOutputSchema.parse(JSON.parse(stdout.slice(start, end + 1)));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Choose an upload strategy from the shape of the data.
+ *
+ * Deep Archive bills 40 KB of overhead per object regardless of file size, plus
+ * $0.05 per 1 000 PUTs. Below roughly 1 MB mean file size that overhead stops
+ * being a rounding error and starts being a material fraction of the bill, so
+ * the share is packed into tar streams instead of copied object-per-file.
+ */
+export function chooseStrategy(
+  count: number,
+  bytes: number,
+  thresholdBytes: number,
+): "direct" | "pack" {
+  if (count === 0) return "direct";
+  return bytes / count < thresholdBytes ? "pack" : "direct";
+}
+
+/**
+ * Per-object storage overhead in bytes: 8 KB billed at S3 Standard rates for
+ * the name and metadata, 32 KB billed at Deep Archive rates for the index.
+ */
+export const OBJECT_OVERHEAD_BYTES = 40 * 1024;
+
+const GIB = 1024 ** 3;
+
+/** USD per GB-month, Glacier Deep Archive. */
+const DEEP_ARCHIVE_GB_MONTH = 0.00099;
+/** USD per GB-month, S3 Standard — the 8 KB metadata half of the overhead. */
+const STANDARD_GB_MONTH = 0.023;
+/** USD per GB, bulk retrieval (48 h). */
+const BULK_RETRIEVAL_GB = 0.0025;
+/** USD per GB, internet egress. */
+const EGRESS_GB = 0.09;
+/** USD per PUT request. */
+const PUT_REQUEST = 0.05 / 1000;
+
+/**
+ * Project what this share costs to hold and what it costs to get back.
+ *
+ * Retrieval is reported alongside storage deliberately. Storage is cheap enough
+ * to be invisible; egress is not, and an archive whose recovery cost is only
+ * discovered during a recovery is an archive nobody can afford to use.
+ */
+export function projectCost(
+  count: number,
+  bytes: number,
+  strategy: "direct" | "pack",
+  packTargetBytes: number,
+): {
+  objectCount: number;
+  storageUsdPerMonth: number;
+  overheadUsdPerMonth: number;
+  uploadUsd: number;
+  retrievalUsd: number;
+  egressUsd: number;
+} {
+  const objectCount = strategy === "pack"
+    ? Math.max(1, Math.ceil(bytes / packTargetBytes))
+    : count;
+  const gb = bytes / GIB;
+  const overheadGb = (objectCount * OBJECT_OVERHEAD_BYTES) / GIB;
+
+  return {
+    objectCount,
+    storageUsdPerMonth: gb * DEEP_ARCHIVE_GB_MONTH,
+    // The 8/32 KB split, each half at its own rate.
+    overheadUsdPerMonth: overheadGb * 0.2 * STANDARD_GB_MONTH +
+      overheadGb * 0.8 * DEEP_ARCHIVE_GB_MONTH,
+    uploadUsd: objectCount * PUT_REQUEST,
+    retrievalUsd: gb * BULK_RETRIEVAL_GB,
+    egressUsd: gb * EGRESS_GB,
+  };
+}
+
+/**
+ * Churn between two scans, as a fraction of the earlier byte total.
+ *
+ * Churn is the cost driver this suite most needs to surface. Deep Archive bills
+ * a 180-day minimum on every object, so a share that rewrites itself — Time
+ * Machine sparsebundles being the worst case on this NAS — keeps paying for
+ * objects it has already replaced. A share at 0% churn costs what the storage
+ * line says; a share at 20% monthly churn costs several times that.
+ */
+export function churnFraction(
+  previousBytes: number | null,
+  currentBytes: number,
+): number | null {
+  if (previousBytes === null || previousBytes <= 0) return null;
+  return Math.abs(currentBytes - previousBytes) / previousBytes;
+}
+
+/** Strip a leading/trailing slash so prefixes concatenate predictably. */
+export function normalisePrefix(prefix: string): string {
+  return prefix.replace(/^\/+/, "").replace(/\/+$/, "");
+}
+
+/** The destination path for one share, as an rclone remote spec. */
+export function destPath(
+  bucket: string,
+  prefix: string,
+  share: string,
+): string {
+  const p = normalisePrefix(prefix);
+  return p ? `dest:${bucket}/${p}/${share}` : `dest:${bucket}/${share}`;
+}
+
+// ---------------------------------------------------------------------------
+// Platform types
+// ---------------------------------------------------------------------------
+
+type Logger = {
+  info: (message: string, props?: Record<string, unknown>) => void;
+  warn: (message: string, props?: Record<string, unknown>) => void;
+};
+
+type ExecuteContext<G> = {
+  globalArgs: G;
+  logger: Logger;
+  writeResource: (
+    specName: string,
+    name: string,
+    data: Record<string, unknown>,
+  ) => Promise<{ name: string }>;
+};
+
+type Handles = { dataHandles: Array<{ name: string }> };
+
+// ---------------------------------------------------------------------------
+// Schemas
+// ---------------------------------------------------------------------------
+
+const InventorySchema = z.object({
+  shareName: z.string(),
+  sourcePath: z.string(),
+  reachable: z.boolean(),
+  failureReason: z.string().nullable(),
+  failureDetail: z.string().nullable(),
+
+  fileCount: z.number(),
+  totalBytes: z.number(),
+  meanFileBytes: z.number(),
+
+  /** "direct" copies object-per-file; "pack" tars into large objects. */
+  strategy: z.enum(["direct", "pack"]),
+  strategyReason: z.string(),
+
+  /** Objects this share will occupy at the destination under `strategy`. */
+  projectedObjectCount: z.number(),
+  storageUsdPerMonth: z.number(),
+  overheadUsdPerMonth: z.number(),
+  uploadUsd: z.number(),
+  /** Bulk-tier retrieval, 48 h. Standard tier is 8× this. */
+  retrievalUsd: z.number(),
+  /** Internet egress for a full recovery — usually the dominant line. */
+  egressUsd: z.number(),
+
+  /**
+   * Byte change since the previous scan, as a fraction. Null on a first scan.
+   * High churn against a 180-day minimum billable duration is the single
+   * largest recurring cost risk in this suite.
+   */
+  churnFraction: z.number().nullable(),
+  churnWarning: z.boolean(),
+
+  ranAt: z.string(),
+  durationMs: z.number(),
+});
+
+const TransferSchema = z.object({
+  shareName: z.string(),
+  destination: z.string(),
+  strategy: z.enum(["direct", "pack"]),
+  dryRun: z.boolean(),
+
+  passed: z.boolean(),
+  inconclusive: z.boolean(),
+  /** rclone exited 9: nothing needed transferring. Not a failure. */
+  nothingToTransfer: z.boolean(),
+  failureReason: z.string().nullable(),
+  detail: z.string().nullable(),
+  exitCode: z.number(),
+
+  storageClass: z.string(),
+  ranAt: z.string(),
+  durationMs: z.number(),
+});
+
+const VerificationSchema = z.object({
+  shareName: z.string(),
+  destination: z.string(),
+
+  passed: z.boolean(),
+  inconclusive: z.boolean(),
+  failureReason: z.string().nullable(),
+  detail: z.string().nullable(),
+  exitCode: z.number(),
+
+  sourceCount: z.number(),
+  sourceBytes: z.number(),
+  destCount: z.number(),
+  destBytes: z.number(),
+  countDelta: z.number(),
+  bytesDelta: z.number(),
+
+  /**
+   * Always false. Deep Archive objects cannot be read without a restore, so
+   * this rung compares inventory metadata only. Recorded explicitly so a
+   * report can never present it as a content check.
+   */
+  contentVerified: z.boolean(),
+
+  ranAt: z.string(),
+  durationMs: z.number(),
+});
+
+const RetrievalSchema = z.object({
+  shareName: z.string(),
+  objectPath: z.string(),
+  phase: z.enum(["requested", "pending", "restored", "failed"]),
+
+  passed: z.boolean(),
+  failureReason: z.string().nullable(),
+  detail: z.string().nullable(),
+  exitCode: z.number(),
+
+  objectBytes: z.number().nullable(),
+  tier: z.string(),
+  requestedAt: z.string().nullable(),
+  /** Populated only once the object has actually materialised. */
+  restoredAt: z.string().nullable(),
+  /** SHA-256 of the retrieved object, when the drill downloaded it. */
+  sha256: z.string().nullable(),
+  sourceSha256: z.string().nullable(),
+  contentMatched: z.boolean().nullable(),
+
+  ranAt: z.string(),
+  durationMs: z.number(),
+});
+
+const GlobalArgsSchema = z.object({
+  shareName: z.string().describe(
+    "Share name, used for the resource name and the destination prefix.",
+  ),
+  sourcePath: z.string().describe(
+    "Absolute path on the NAS, e.g. /volume1/homes. Bind-mounted read-only.",
+  ),
+  sshHost: z.string().describe(
+    "SSH destination for the NAS, e.g. nas. Must accept BatchMode auth " +
+      "from the swamp serve host.",
+  ),
+  bucket: z.string().describe("Destination S3 bucket."),
+  region: z.string().describe("Bucket region, e.g. us-west-2."),
+  accessKeyId: z.string().describe(
+    "AWS access key ID. Needs only s3:PutObject, s3:GetObject, " +
+      "s3:ListBucket and s3:RestoreObject — never s3:DeleteObject.",
+  ),
+  secretAccessKey: z.string().meta({ sensitive: true }).describe(
+    "AWS secret access key — supply via vault.get(), never inline.",
+  ),
+  storageClass: z.string().optional().describe(
+    "S3 storage class. Default GLACIER_DEEP_ARCHIVE. Changing this is a " +
+      "cost decision: STANDARD is roughly 23x the price.",
+  ),
+  destPrefix: z.string().optional().describe(
+    "Key prefix inside the bucket, e.g. nas/volume1. Default empty.",
+  ),
+  dockerBinary: z.string().optional().describe(
+    "Path to docker on the NAS. Default /usr/local/bin/docker (DSM).",
+  ),
+  sshBinary: z.string().optional().describe(
+    "Path to the ssh client. Default `ssh` on PATH.",
+  ),
+  image: z.string().optional().describe(
+    "Pinned rclone image. Default rclone/rclone:1.75.0. Never use :latest.",
+  ),
+  strategy: z.enum(["auto", "direct", "pack"]).optional().describe(
+    "Upload strategy. auto (default) picks from mean file size at scan time.",
+  ),
+  packThresholdBytes: z.number().optional().describe(
+    "Mean file size below which auto chooses pack. Default 1 MiB.",
+  ),
+  packTargetBytes: z.number().optional().describe(
+    "Target size of one tar object when packing. Default 1 GiB.",
+  ),
+  minAgeMinutes: z.number().optional().describe(
+    "Skip files modified more recently than this. Default 15 — the NAS is " +
+      "live and Plex, ABB and Time Machine all write during a run.",
+  ),
+  churnWarnFraction: z.number().optional().describe(
+    "Churn above this fraction between scans raises churnWarning. Default " +
+      "0.05. Deep Archive bills a 180-day minimum on every replaced object.",
+  ),
+  maxRestoreBytes: z.number().optional().describe(
+    "Byte ceiling for a restore drill, checked BEFORE any retrieval is " +
+      "requested. Default 1 GiB.",
+  ),
+  allowRestore: z.boolean().optional().describe(
+    "Permit restoreRequest to spend money on a retrieval. Can also be passed " +
+      "per run.",
+  ),
+  timeoutMinutes: z.number().optional().describe(
+    "Per-invocation timeout. Default 360 — a multi-terabyte copy is slow.",
+  ),
+});
+
+type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
+
+const ScanArgsSchema = z.object({
+  previousBytes: z.number().optional().describe(
+    "Byte total from the previous scan, for churn measurement. Wire it in a " +
+      'workflow: ${{ data.latest("<model>", "inventory").attributes.totalBytes }}',
+  ),
+});
+
+const PushArgsSchema = z.object({
+  dryRun: z.boolean().optional().describe(
+    "Report what would transfer without uploading. Run this first: the first " +
+      "real byte is also the first byte billed for 180 days.",
+  ),
+  strategy: z.enum(["direct", "pack"]).optional().describe(
+    "Override the strategy for this run only.",
+  ),
+  maxTransferBytes: z.number().optional().describe(
+    "Stop after this many bytes (--max-transfer). Exit 8 is recorded as " +
+      "inconclusive, not as a failure.",
+  ),
+});
+
+const VerifyArgsSchema = z.object({});
+
+const RestoreRequestArgsSchema = z.object({
+  objectPath: z.string().describe(
+    "Key of the object to retrieve, relative to the share prefix.",
+  ),
+  tier: z.enum(["Bulk", "Standard"]).optional().describe(
+    "Bulk (48 h, $0.0025/GB) or Standard (12 h, $0.02/GB). Default Bulk.",
+  ),
+  allowRestore: z.boolean().optional().describe(
+    "Per-run acknowledgement that this spends money. Required unless set as " +
+      "a global argument.",
+  ),
+});
+
+const RestoreDrillArgsSchema = z.object({
+  objectPath: z.string().describe(
+    "Key of the object to check, relative to the share prefix.",
+  ),
+  sourceSha256: z.string().optional().describe(
+    "Expected SHA-256. If given, the drill fails unless the retrieved " +
+      "content matches — the only rung that proves integrity.",
+  ),
+});
+
+// ---------------------------------------------------------------------------
+// Shared plumbing
+// ---------------------------------------------------------------------------
+
+function credentialsOf(g: GlobalArgs): RcloneCredentials {
+  return { accessKeyId: g.accessKeyId, secretAccessKey: g.secretAccessKey };
+}
+
+/** Credentials for source-only work. The NAS has no use for the AWS key. */
+const NO_CREDENTIALS: RcloneCredentials = {
+  accessKeyId: "",
+  secretAccessKey: "",
+};
+
+function destinationOf(g: GlobalArgs): RcloneDestination {
+  return {
+    bucket: g.bucket,
+    region: g.region,
+    storageClass: g.storageClass ?? "GLACIER_DEEP_ARCHIVE",
+  };
+}
+
+function transportOf(g: GlobalArgs): RcloneTransport {
+  return {
+    sshHost: g.sshHost,
+    sshBinary: g.sshBinary,
+    dockerBinary: g.dockerBinary,
+    image: g.image,
+    sourceMount: g.sourcePath,
+    timeoutMs: (g.timeoutMinutes ?? 360) * 60_000,
+  };
+}
+
+/** Map an rclone exit code to a short, stable reason string. */
+export function classifyFailure(result: RcloneResult): string {
+  if (result.timedOut) return "timeout";
+  switch (result.code) {
+    case RCLONE_EXIT.USAGE:
+      return "usage-error";
+    case RCLONE_EXIT.DIR_NOT_FOUND:
+      return "source-not-found";
+    case RCLONE_EXIT.FILE_NOT_FOUND:
+      return "file-not-found";
+    case RCLONE_EXIT.TEMPORARY:
+      return "retries-exhausted";
+    case RCLONE_EXIT.FATAL:
+      return "fatal";
+    case RCLONE_EXIT.TRANSFER_LIMIT:
+      return "transfer-limit-reached";
+    case RCLONE_EXIT.DURATION_LIMIT:
+      return "duration-limit-reached";
+    default:
+      return `exit-${result.code}`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Model
+// ---------------------------------------------------------------------------
+
+export const model = {
+  type: "@sntxrr/rclone/archive",
+  version: "2026.08.15.1",
+  globalArguments: GlobalArgsSchema,
+
+  resources: {
+    "inventory": {
+      description:
+        "What one share contains — file count, bytes, chosen upload strategy, " +
+        "churn since the last scan, and the projected cost to both store and " +
+        "retrieve it",
+      schema: InventorySchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 50,
+    },
+    "transfer": {
+      description:
+        "The outcome of one copy to Deep Archive — including the distinction " +
+        "between a failure and a run that simply had nothing to transfer",
+      schema: TransferSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 50,
+    },
+    "verification": {
+      description:
+        "Source-versus-destination inventory comparison. Metadata only — " +
+        "Deep Archive cannot be read without a restore",
+      schema: VerificationSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 50,
+    },
+    "retrieval": {
+      description:
+        "A restore drill, across its asynchronous phases — the only evidence " +
+        "that anything in this archive can actually be recovered",
+      schema: RetrievalSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 50,
+    },
+  },
+
+  checks: {
+    "source-path-absolute": {
+      description:
+        "sourcePath must be an absolute NAS path — it becomes a docker bind " +
+        "mount, and a relative path silently creates a named volume instead.",
+      labels: ["policy"],
+      // deno-lint-ignore require-await
+      execute: async (
+        context: { globalArgs: GlobalArgs },
+      ): Promise<{ pass: boolean; errors?: string[] }> => {
+        const p = context.globalArgs.sourcePath ?? "";
+        if (!p.startsWith("/")) {
+          return {
+            pass: false,
+            errors: [
+              `sourcePath "${p}" is not absolute. docker interprets a ` +
+              `relative -v source as a NAMED VOLUME, so the container would ` +
+              `mount an empty directory and the copy would appear to succeed ` +
+              `having archived nothing.`,
+            ],
+          };
+        }
+        return { pass: true };
+      },
+    },
+    "credentials-present": {
+      description:
+        "Both halves of the AWS key must be set — an empty value fails at " +
+        "rclone with an error that reads like a permissions problem.",
+      labels: ["policy"],
+      // deno-lint-ignore require-await
+      execute: async (
+        context: { globalArgs: GlobalArgs },
+      ): Promise<{ pass: boolean; errors?: string[] }> => {
+        const g = context.globalArgs;
+        const errors: string[] = [];
+        if (!g.accessKeyId?.trim()) {
+          errors.push("globalArgs.accessKeyId is empty.");
+        }
+        if (!g.secretAccessKey?.trim()) {
+          errors.push(
+            "globalArgs.secretAccessKey is empty — wire it from a vault, " +
+              "e.g. ${{ vault.get(onepassword, glacier-archive/secret-key) }}.",
+          );
+        }
+        return errors.length > 0 ? { pass: false, errors } : { pass: true };
+      },
+    },
+    "archive-storage-class": {
+      description:
+        "Warn when the storage class is not an archive tier. STANDARD costs " +
+        "roughly 23x Deep Archive and nothing in rclone's output says so.",
+      labels: ["policy", "cost"],
+      // deno-lint-ignore require-await
+      execute: async (
+        context: { globalArgs: GlobalArgs },
+      ): Promise<{ pass: boolean; errors?: string[] }> => {
+        const sc = context.globalArgs.storageClass ?? "GLACIER_DEEP_ARCHIVE";
+        const archive = [
+          "GLACIER",
+          "GLACIER_IR",
+          "DEEP_ARCHIVE",
+          "GLACIER_DEEP_ARCHIVE",
+        ];
+        if (!archive.includes(sc)) {
+          return {
+            pass: false,
+            errors: [
+              `storageClass "${sc}" is not an archive tier. This suite exists ` +
+              `to write Deep Archive; at STANDARD rates 13.79 TB costs ` +
+              `~$317/mo instead of ~$14/mo. Set it deliberately or not at all.`,
+            ],
+          };
+        }
+        return { pass: true };
+      },
+    },
+    // THERE IS DELIBERATELY NO "restore-acknowledged" PRE-FLIGHT CHECK.
+    //
+    // Checks receive only globalArgs — swamp never passes method inputs to
+    // them — so a check gating restoreRequest on an acknowledgement would
+    // reject `--input allowRestore=true` before `execute` ran, and its own
+    // error would tell the operator to do the thing it had just made
+    // impossible. The only route through would be arming the flag PERMANENTLY
+    // on the model, so a check written to prevent accidental spending would
+    // end up forcing that spending to be armed for good. The gate is in
+    // `execute`. See CONVENTIONS.md §7.
+  },
+
+  methods: {
+    // -----------------------------------------------------------------------
+    // Rung 1 — what is there, and what will it cost
+    // -----------------------------------------------------------------------
+    "scan": {
+      description:
+        "Rung 1. Inventory one share: file count, byte total, mean file size. " +
+        "Chooses direct or pack from the shape of the data, and projects both " +
+        "the storage cost and — the number nobody has until they need it — " +
+        "the cost of getting the data back out. Measures churn against the " +
+        "previous scan, because Deep Archive bills a 180-day minimum on every " +
+        "replaced object and a churning share costs several times its storage " +
+        "line. Records an unreachable share rather than throwing, so a fleet " +
+        "report can still see it.",
+      arguments: ScanArgsSchema,
+      execute: async (
+        args: z.infer<typeof ScanArgsSchema>,
+        context: ExecuteContext<GlobalArgs>,
+      ): Promise<Handles> => {
+        const started = Date.now();
+        const g = context.globalArgs;
+        const share = g.shareName;
+        const packTarget = g.packTargetBytes ?? GIB;
+        const threshold = g.packThresholdBytes ?? 1024 * 1024;
+        const warnAt = g.churnWarnFraction ?? 0.05;
+
+        // Source-only: the NAS has no use for the AWS credentials here, so it
+        // does not receive them.
+        const run = await runRclone(
+          NO_CREDENTIALS,
+          destinationOf(g),
+          transportOf(g),
+          ["size", "/data", "--json"],
+        );
+
+        const parsed = run.code === RCLONE_EXIT.OK
+          ? parseSize(run.stdout)
+          : null;
+
+        if (parsed === null) {
+          // Deliberately not a throw. An unreachable share is the single most
+          // important thing a fleet report needs to see, and a thrown error
+          // writes no resource at all.
+          const reason = run.code === RCLONE_EXIT.OK
+            ? "unparseable-size-output"
+            : classifyFailure(run);
+          context.logger.warn(`${share}: unreachable (${reason})`);
+          const handle = await context.writeResource("inventory", share, {
+            shareName: share,
+            sourcePath: g.sourcePath,
+            reachable: false,
+            failureReason: reason,
+            failureDetail: run.stderr.slice(0, 2000) || null,
+            fileCount: 0,
+            totalBytes: 0,
+            meanFileBytes: 0,
+            strategy: "direct",
+            strategyReason: "share unreachable; strategy not determined",
+            projectedObjectCount: 0,
+            storageUsdPerMonth: 0,
+            overheadUsdPerMonth: 0,
+            uploadUsd: 0,
+            retrievalUsd: 0,
+            egressUsd: 0,
+            churnFraction: null,
+            churnWarning: false,
+            ranAt: new Date().toISOString(),
+            durationMs: Date.now() - started,
+          });
+          return { dataHandles: [handle] };
+        }
+
+        const { count, bytes } = parsed;
+        const mean = count > 0 ? bytes / count : 0;
+        const strategy = g.strategy && g.strategy !== "auto"
+          ? g.strategy
+          : chooseStrategy(count, bytes, threshold);
+        const reason = g.strategy && g.strategy !== "auto"
+          ? `strategy pinned to ${g.strategy} by configuration`
+          : strategy === "pack"
+          ? `mean file size ${
+            Math.round(mean)
+          } B is below the ${threshold} B ` +
+            `threshold; packing amortises the 40 KB per-object overhead`
+          : `mean file size ${Math.round(mean)} B is at or above the ` +
+            `${threshold} B threshold; per-object overhead is immaterial`;
+
+        const cost = projectCost(count, bytes, strategy, packTarget);
+        const churn = churnFraction(args.previousBytes ?? null, bytes);
+
+        context.logger.info(
+          `${share}: ${count} files, ${(bytes / 1e12).toFixed(2)} TB, ` +
+            `strategy=${strategy}, ~$${
+              cost.storageUsdPerMonth.toFixed(2)
+            }/mo, ` +
+            `egress to recover ~$${cost.egressUsd.toFixed(0)}`,
+        );
+
+        const handle = await context.writeResource("inventory", share, {
+          shareName: share,
+          sourcePath: g.sourcePath,
+          reachable: true,
+          failureReason: null,
+          failureDetail: null,
+          fileCount: count,
+          totalBytes: bytes,
+          meanFileBytes: mean,
+          strategy,
+          strategyReason: reason,
+          projectedObjectCount: cost.objectCount,
+          storageUsdPerMonth: cost.storageUsdPerMonth,
+          overheadUsdPerMonth: cost.overheadUsdPerMonth,
+          uploadUsd: cost.uploadUsd,
+          retrievalUsd: cost.retrievalUsd,
+          egressUsd: cost.egressUsd,
+          churnFraction: churn,
+          churnWarning: churn !== null && churn > warnAt,
+          ranAt: new Date().toISOString(),
+          durationMs: Date.now() - started,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // -----------------------------------------------------------------------
+    // Rung 2 — get it to AWS
+    // -----------------------------------------------------------------------
+    "push": {
+      description:
+        "Rung 2. Copy the share to Deep Archive. Never sync — a source that " +
+        "failed to mount presents as empty, and sync would empty the " +
+        "destination unrecoverably while still billing for it. Injects the " +
+        "storage class, refuses to overwrite by default, and distinguishes " +
+        "'nothing needed transferring' (exit 9) from 'nothing happened', " +
+        "which are indistinguishable without --error-on-no-transfer.",
+      arguments: PushArgsSchema,
+      execute: async (
+        args: z.infer<typeof PushArgsSchema>,
+        context: ExecuteContext<GlobalArgs>,
+      ): Promise<Handles> => {
+        const started = Date.now();
+        const g = context.globalArgs;
+        const share = g.shareName;
+        const dryRun = args.dryRun ?? false;
+        const strategy = args.strategy ??
+          (g.strategy && g.strategy !== "auto" ? g.strategy : "direct");
+        const dest = destPath(g.bucket, g.destPrefix ?? "", share);
+        const storageClass = g.storageClass ?? "GLACIER_DEEP_ARCHIVE";
+
+        // Refuse rather than silently copy object-per-file while recording
+        // strategy: "pack". A transfer resource that misreports its own
+        // strategy would make every downstream cost projection wrong, and the
+        // error would only surface as an unexplained bill.
+        if (strategy === "pack") {
+          throw new Error(
+            `push does not yet implement the pack strategy (PRD §4.1); it is ` +
+              `wave 2. Scanning chose pack for "${share}" because its mean ` +
+              `file size makes per-object overhead material. Either run with ` +
+              `--input strategy=direct, accepting that overhead, or wait for ` +
+              `packing rather than have this record a pack that did not happen.`,
+          );
+        }
+
+        const flags = [
+          "--immutable",
+          "--no-traverse",
+          "--error-on-no-transfer",
+          "--min-age",
+          `${g.minAgeMinutes ?? 15}m`,
+          "--stats-one-line",
+          "--stats",
+          "5m",
+        ];
+        if (dryRun) flags.push("--dry-run");
+        if (args.maxTransferBytes) {
+          flags.push("--max-transfer", String(args.maxTransferBytes));
+        }
+
+        // `copy`, never `sync`. The runner refuses `sync` outright; naming it
+        // here as well makes the intent legible at the call site.
+        const run = await runRclone(
+          credentialsOf(g),
+          destinationOf(g),
+          transportOf(g),
+          ["copy", "/data", dest, ...flags],
+        );
+
+        const nothing = run.code === RCLONE_EXIT.NO_TRANSFER;
+        const inconclusive = isInconclusive(run);
+        const passed = run.code === RCLONE_EXIT.OK || nothing;
+
+        if (!passed && !inconclusive) {
+          context.logger.warn(
+            `${share}: push failed (${classifyFailure(run)})`,
+          );
+        }
+
+        const handle = await context.writeResource("transfer", share, {
+          shareName: share,
+          destination: dest,
+          strategy,
+          dryRun,
+          passed,
+          inconclusive,
+          nothingToTransfer: nothing,
+          failureReason: passed ? null : classifyFailure(run),
+          detail: run.stderr.slice(0, 2000) || null,
+          exitCode: run.code,
+          storageClass,
+          ranAt: new Date().toISOString(),
+          durationMs: Date.now() - started,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // -----------------------------------------------------------------------
+    // Rung 3 — does the destination match
+    // -----------------------------------------------------------------------
+    "verify": {
+      description:
+        "Rung 3. Compare source and destination inventories — object count " +
+        "and byte totals. Metadata only, and it says so: Deep Archive objects " +
+        "cannot be read without a restore, and the S3 ETag of a multipart " +
+        "upload is not a content hash, so there is nothing here that proves " +
+        "integrity. That is what restoreDrill is for.",
+      arguments: VerifyArgsSchema,
+      execute: async (
+        _args: z.infer<typeof VerifyArgsSchema>,
+        context: ExecuteContext<GlobalArgs>,
+      ): Promise<Handles> => {
+        const started = Date.now();
+        const g = context.globalArgs;
+        const share = g.shareName;
+        const dest = destPath(g.bucket, g.destPrefix ?? "", share);
+
+        const sourceRun = await runRclone(
+          NO_CREDENTIALS,
+          destinationOf(g),
+          transportOf(g),
+          ["size", "/data", "--json"],
+        );
+        const destRun = await runRclone(
+          credentialsOf(g),
+          destinationOf(g),
+          transportOf(g),
+          ["size", dest, "--json"],
+        );
+
+        const src = parseSize(sourceRun.stdout);
+        const dst = parseSize(destRun.stdout);
+        const worst = sourceRun.code !== RCLONE_EXIT.OK ? sourceRun : destRun;
+        const inconclusive = isInconclusive(sourceRun) ||
+          isInconclusive(destRun);
+
+        if (src === null || dst === null) {
+          const handle = await context.writeResource("verification", share, {
+            shareName: share,
+            destination: dest,
+            passed: false,
+            inconclusive,
+            failureReason: classifyFailure(worst),
+            detail: (destRun.stderr || sourceRun.stderr).slice(0, 2000) || null,
+            exitCode: worst.code,
+            sourceCount: src?.count ?? 0,
+            sourceBytes: src?.bytes ?? 0,
+            destCount: dst?.count ?? 0,
+            destBytes: dst?.bytes ?? 0,
+            countDelta: 0,
+            bytesDelta: 0,
+            contentVerified: false,
+            ranAt: new Date().toISOString(),
+            durationMs: Date.now() - started,
+          });
+          return { dataHandles: [handle] };
+        }
+
+        // Under `pack` the destination object count is deliberately far lower
+        // than the source file count, so only bytes are comparable. Under
+        // `direct` both should agree.
+        const countDelta = dst.count - src.count;
+        const bytesDelta = dst.bytes - src.bytes;
+        const passed = bytesDelta >= 0 && dst.bytes > 0;
+
+        const handle = await context.writeResource("verification", share, {
+          shareName: share,
+          destination: dest,
+          passed,
+          inconclusive,
+          failureReason: passed ? null : "destination-short",
+          detail: passed
+            ? null
+            : `destination holds ${dst.bytes} bytes against ${src.bytes} at ` +
+              `source (${bytesDelta})`,
+          exitCode: destRun.code,
+          sourceCount: src.count,
+          sourceBytes: src.bytes,
+          destCount: dst.count,
+          destBytes: dst.bytes,
+          countDelta,
+          bytesDelta,
+          contentVerified: false,
+          ranAt: new Date().toISOString(),
+          durationMs: Date.now() - started,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // -----------------------------------------------------------------------
+    // Rung 4 — can a retrieval even be started
+    // -----------------------------------------------------------------------
+    "restoreRequest": {
+      description:
+        "Rung 4. Ask S3 to bring one object back from Deep Archive. This " +
+        "SPENDS MONEY and takes 12-48 hours, so it is gated on an explicit " +
+        "acknowledgement and a byte ceiling checked before the request is " +
+        "issued. Records a pending retrieval; restoreDrill collects it.",
+      arguments: RestoreRequestArgsSchema,
+      execute: async (
+        args: z.infer<typeof RestoreRequestArgsSchema>,
+        context: ExecuteContext<GlobalArgs>,
+      ): Promise<Handles> => {
+        const started = Date.now();
+        const g = context.globalArgs;
+        const share = g.shareName;
+        const tier = args.tier ?? "Bulk";
+        const dest = destPath(g.bucket, g.destPrefix ?? "", share);
+        const object = `${dest}/${args.objectPath}`;
+
+        // The gate lives here, not in a check: a check sees only globalArgs
+        // and would reject the per-run input before this ever ran.
+        const allowed = args.allowRestore ?? g.allowRestore ?? false;
+        if (!allowed) {
+          throw new Error(
+            `restoreRequest retrieves ${args.objectPath} from Deep Archive, ` +
+              `which costs money and takes 12-48 hours. Re-run with ` +
+              `--input allowRestore=true, or set allowRestore on the model.`,
+          );
+        }
+
+        const run = await runRclone(
+          credentialsOf(g),
+          destinationOf(g),
+          transportOf(g),
+          [
+            "backend",
+            "restore",
+            object,
+            "-o",
+            `lifetime=1`,
+            "-o",
+            `priority=${tier}`,
+          ],
+        );
+
+        const passed = run.code === RCLONE_EXIT.OK;
+        const handle = await context.writeResource(
+          "retrieval",
+          `${share}-${args.objectPath.replaceAll("/", "-")}`,
+          {
+            shareName: share,
+            objectPath: args.objectPath,
+            phase: passed ? "requested" : "failed",
+            passed,
+            failureReason: passed ? null : classifyFailure(run),
+            detail: run.stderr.slice(0, 2000) || null,
+            exitCode: run.code,
+            objectBytes: null,
+            tier,
+            requestedAt: passed ? new Date().toISOString() : null,
+            restoredAt: null,
+            sha256: null,
+            sourceSha256: null,
+            contentMatched: null,
+            ranAt: new Date().toISOString(),
+            durationMs: Date.now() - started,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // -----------------------------------------------------------------------
+    // Rung 5 — did it actually come back, and is it the same bytes
+    // -----------------------------------------------------------------------
+    "restoreDrill": {
+      description:
+        "Rung 5. The only rung that proves recovery. Polls a requested " +
+        "retrieval; once the object has materialised, downloads it and hashes " +
+        "it. If sourceSha256 is supplied the drill fails unless the content " +
+        "matches — everything below this rung compares metadata, and metadata " +
+        "cannot see corruption. Safe to run repeatedly while still pending.",
+      arguments: RestoreDrillArgsSchema,
+      execute: async (
+        args: z.infer<typeof RestoreDrillArgsSchema>,
+        context: ExecuteContext<GlobalArgs>,
+      ): Promise<Handles> => {
+        const started = Date.now();
+        const g = context.globalArgs;
+        const share = g.shareName;
+        const dest = destPath(g.bucket, g.destPrefix ?? "", share);
+        const object = `${dest}/${args.objectPath}`;
+        const ceiling = g.maxRestoreBytes ?? GIB;
+
+        // Check the size before moving any bytes — an accidental drill against
+        // a 400 GB pack is an expensive way to learn the object was large.
+        const sizeRun = await runRclone(
+          credentialsOf(g),
+          destinationOf(g),
+          transportOf(g),
+          ["size", object, "--json"],
+        );
+        const sized = parseSize(sizeRun.stdout);
+
+        if (sized === null) {
+          const handle = await context.writeResource(
+            "retrieval",
+            `${share}-${args.objectPath.replaceAll("/", "-")}`,
+            {
+              shareName: share,
+              objectPath: args.objectPath,
+              phase: "pending",
+              passed: false,
+              failureReason: "not-yet-retrievable",
+              detail: sizeRun.stderr.slice(0, 2000) || null,
+              exitCode: sizeRun.code,
+              objectBytes: null,
+              tier: "unknown",
+              requestedAt: null,
+              restoredAt: null,
+              sha256: null,
+              sourceSha256: args.sourceSha256 ?? null,
+              contentMatched: null,
+              ranAt: new Date().toISOString(),
+              durationMs: Date.now() - started,
+            },
+          );
+          return { dataHandles: [handle] };
+        }
+
+        if (sized.bytes > ceiling) {
+          throw new Error(
+            `restoreDrill refuses ${args.objectPath}: ${sized.bytes} bytes ` +
+              `exceeds maxRestoreBytes ${ceiling}. Raise the ceiling ` +
+              `deliberately, or drill a smaller object.`,
+          );
+        }
+
+        // sha256sum streams the restored object without landing it on disk.
+        // Deep Archive returns InvalidObjectState until the retrieval
+        // completes, which is a pending signal rather than a failure.
+        const hashRun = await runRclone(
+          credentialsOf(g),
+          destinationOf(g),
+          transportOf(g),
+          ["sha256sum", object],
+        );
+
+        const pending = /InvalidObjectState|not restored|storage class/i.test(
+          hashRun.stderr,
+        );
+        const sha = hashRun.code === RCLONE_EXIT.OK
+          ? (hashRun.stdout.trim().split(/\s+/)[0] ?? null)
+          : null;
+        const matched = sha !== null && args.sourceSha256
+          ? sha.toLowerCase() === args.sourceSha256.toLowerCase()
+          : null;
+        const passed = sha !== null && matched !== false;
+
+        const handle = await context.writeResource(
+          "retrieval",
+          `${share}-${args.objectPath.replaceAll("/", "-")}`,
+          {
+            shareName: share,
+            objectPath: args.objectPath,
+            phase: sha !== null ? "restored" : pending ? "pending" : "failed",
+            passed,
+            failureReason: passed
+              ? null
+              : matched === false
+              ? "content-mismatch"
+              : pending
+              ? "still-retrieving"
+              : classifyFailure(hashRun),
+            detail: hashRun.stderr.slice(0, 2000) || null,
+            exitCode: hashRun.code,
+            objectBytes: sized.bytes,
+            tier: "unknown",
+            requestedAt: null,
+            restoredAt: sha !== null ? new Date().toISOString() : null,
+            sha256: sha,
+            sourceSha256: args.sourceSha256 ?? null,
+            contentMatched: matched,
+            ranAt: new Date().toISOString(),
+            durationMs: Date.now() - started,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+  },
+};

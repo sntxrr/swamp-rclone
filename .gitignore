@@ -1,0 +1,31 @@
+# BEGIN swamp managed section - DO NOT EDIT
+
+# Runtime data (not needed in version control)
+.swamp/
+
+# Local extension sources (developer-specific, not shared)
+.swamp-sources.yaml
+
+# Claude Code configuration (managed by swamp)
+.claude/worktrees/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
+# END swamp managed section
+
+# Vault definitions. `swamp vault create --config` persists whatever it is
+# given verbatim, and marking a field `sensitive` governs logging, not what
+# lands on disk — so a literal key passed on the command line becomes a live
+# AWS credential in a tracked file. Never commit a vault definition; wire
+# secrets as vault references and keep the file out of git.
+vaults/
+
+# Model definitions. Every instance is named after a real share on a real NAS
+# and carries the real bucket name — committing them would publish the
+# complete contents inventory of the volume this suite exists to protect. The
+# README documents the shape with fictional names instead.
+/models/
+
+# Restore-drill scratch. A drill retrieves real archived content; that content
+# is production data and must never reach git.
+restore-drills/
