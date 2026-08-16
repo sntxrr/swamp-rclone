@@ -1048,6 +1048,106 @@ export function classifyFailure(result: RcloneResult): string {
 }
 
 /**
+ * Escape rclone filter glob metacharacters so a literal name matches literally.
+ *
+ * rclone filter patterns are globs: `*`, `?`, `[...]` and `{a,b}` are all
+ * operators. A share containing `take[1].wav` would otherwise be a character
+ * class, and the restore would select the wrong objects — each of which costs
+ * money to retrieve.
+ */
+export function escapeFilterPattern(name: string): string {
+  return name.replaceAll(/[\\*?[\]{}]/g, (c) => `\\${c}`);
+}
+
+/**
+ * Build the argv that restores exactly ONE object.
+ *
+ * `rclone backend restore` operates on a DIRECTORY and selects within it using
+ * filters. Handed an object path directly it fails with "is a file not a
+ * directory" (exit 1) — which is how every restore in this suite failed until
+ * a live drill was attempted.
+ *
+ * So the remote is rooted at the object's parent and the object is selected by
+ * an `--include` anchored with a leading `/`. The anchor is load-bearing: an
+ * unanchored pattern matches at ANY depth, so restoring `chords.mid` would
+ * silently retrieve every `chords.mid` in the share and bill for all of them.
+ */
+export function buildRestoreArgs(
+  dest: string,
+  objectPath: string,
+  tier: string,
+): string[] {
+  const cut = objectPath.lastIndexOf("/");
+  const dir = cut === -1 ? "" : objectPath.slice(0, cut);
+  const base = cut === -1 ? objectPath : objectPath.slice(cut + 1);
+  if (base === "") {
+    throw new Error(
+      `refusing to run: objectPath "${objectPath}" names a directory, not an ` +
+        `object. A directory would restore everything beneath it, and every ` +
+        `retrieved byte is billed.`,
+    );
+  }
+  return [
+    "backend",
+    "restore",
+    dir === "" ? dest : `${dest}/${dir}`,
+    "--include",
+    `/${escapeFilterPattern(base)}`,
+    "-o",
+    "lifetime=1",
+    "-o",
+    `priority=${tier}`,
+  ];
+}
+
+/** One row of `rclone backend restore` JSON output. */
+export interface RestoreStatus {
+  remote: string;
+  status: string;
+}
+
+/**
+ * Read the per-object outcome out of `rclone backend restore`.
+ *
+ * This exists because **the exit code cannot be trusted here**. Verified
+ * against a live bucket:
+ *
+ *   - a per-object S3 error exits **0**, reporting the failure only in the
+ *     JSON `Status` field;
+ *   - a filter that matches **nothing** also exits 0, restoring nothing at all.
+ *
+ * Reading the exit code alone therefore records a request that failed — or one
+ * that silently selected no object, the likely shape of a typo'd path — as a
+ * successful retrieval. The drill then discovers it hours later, which is the
+ * exact class of silent failure this suite exists to prevent.
+ */
+export function parseRestoreStatus(stdout: string): RestoreStatus[] {
+  const start = stdout.indexOf("[");
+  if (start === -1) return [];
+  try {
+    const parsed = JSON.parse(stdout.slice(start));
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((r) => r && typeof r === "object")
+      .map((r) => ({
+        remote: String(r.Remote ?? ""),
+        status: String(r.Status ?? ""),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * S3 answers a re-request for an in-flight retrieval with 409
+ * RestoreAlreadyInProgress. That is the idempotent case, not a failure —
+ * re-running `restoreRequest` while waiting is the obvious operator move.
+ */
+export function isRestoreAlreadyInProgress(status: string): boolean {
+  return /RestoreAlreadyInProgress/i.test(status);
+}
+
+/**
  * The pack path of `push`.
  *
  * Streams one tar per top-level entry straight into a Deep Archive object.
@@ -1703,7 +1803,6 @@ export const model = {
         const share = g.shareName;
         const tier = args.tier ?? "Bulk";
         const dest = destPath(g.bucket, g.destPrefix ?? "", share);
-        const object = `${dest}/${args.objectPath}`;
 
         // The gate lives here, not in a check: a check sees only globalArgs
         // and would reject the per-run input before this ever ran.
@@ -1720,18 +1819,29 @@ export const model = {
           credentialsOf(g),
           destinationOf(g),
           transportOf(g),
-          [
-            "backend",
-            "restore",
-            object,
-            "-o",
-            `lifetime=1`,
-            "-o",
-            `priority=${tier}`,
-          ],
+          buildRestoreArgs(dest, args.objectPath, tier),
         );
 
-        const passed = run.code === RCLONE_EXIT.OK;
+        // The exit code is necessary but nowhere near sufficient — see
+        // parseRestoreStatus. Both a per-object S3 error and a filter that
+        // matched nothing exit 0.
+        const rows = parseRestoreStatus(run.stdout);
+        const bad = rows.filter((r) =>
+          r.status !== "OK" && !isRestoreAlreadyInProgress(r.status)
+        );
+        const passed = run.code === RCLONE_EXIT.OK && rows.length > 0 &&
+          bad.length === 0;
+
+        const requestDetail = run.code !== RCLONE_EXIT.OK
+          ? run.stderr.slice(0, 2000) || null
+          : rows.length === 0
+          ? `rclone restored no object: nothing in the archive matched ` +
+            `"${args.objectPath}". rclone reports this as success, so the ` +
+            `path is almost certainly wrong — check it against verify output ` +
+            `before waiting hours for a drill that cannot pass.`
+          : bad.length > 0
+          ? bad.map((r) => `${r.remote}: ${r.status}`).join("; ").slice(0, 2000)
+          : null;
         const handle = await context.writeResource(
           "retrieval",
           `${share}-${args.objectPath.replaceAll("/", "-")}`,
@@ -1740,8 +1850,17 @@ export const model = {
             objectPath: args.objectPath,
             phase: passed ? "requested" : "failed",
             passed,
-            failureReason: passed ? null : classifyFailure(run),
-            detail: run.stderr.slice(0, 2000) || null,
+            // A clean exit that restored nothing is not "exit-0" — it is a
+            // path that matched no object, and saying so is the difference
+            // between a fix now and a failed drill hours from now.
+            failureReason: passed
+              ? null
+              : run.code !== RCLONE_EXIT.OK
+              ? classifyFailure(run)
+              : rows.length === 0
+              ? "no-object-matched"
+              : "restore-rejected",
+            detail: requestDetail,
             exitCode: run.code,
             objectBytes: null,
             tier,
