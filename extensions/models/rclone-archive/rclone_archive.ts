@@ -2195,7 +2195,17 @@ export const model = {
             credentialsOf(g),
             destinationOf(g),
             transportOf(g),
-            ["sha256sum", object],
+            // `hashsum sha256`, NOT `sha256sum`. rclone has dedicated `md5sum`
+            // and `sha1sum` commands and no `sha256sum`, so the symmetrical
+            // spelling exits 2 with `unknown command` — which is how this was
+            // found, on the first live retrieval this suite ever completed.
+            //
+            // `--download` is what makes the rung mean anything. Without it
+            // rclone asks the REMOTE for the hash, and S3 does not serve
+            // SHA-256, so nothing would be downloaded and nothing proved: the
+            // drill exists to show the bytes come back, not to read metadata
+            // about bytes that never moved.
+            ["hashsum", "sha256", object, "--download"],
           );
 
         const pending = /InvalidObjectState|not restored|storage class/i.test(

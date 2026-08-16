@@ -1123,6 +1123,38 @@ esac`,
   }
 });
 
+Deno.test("restoreDrill on an unpacked object hashes with hashsum, and DOWNLOADS", async () => {
+  // Two failures this pins down, both found on the first live retrieval:
+  //
+  // rclone has dedicated md5sum and sha1sum commands but NO sha256sum, so the
+  // symmetrical spelling exits 2 with `unknown command`. Nothing in the suite
+  // caught it because no test asserted what the direct path actually runs.
+  //
+  // And --download is the difference between a drill and a formality: without
+  // it rclone asks the remote for the hash, S3 does not serve SHA-256, and no
+  // byte ever leaves Glacier.
+  const ssh = await fakeSsh(
+    `case "$*" in
+  *"size"*) echo '{"count":1,"bytes":100}' ;;
+  *) echo "abc123  x" ;;
+esac`,
+  );
+  const { context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.restoreDrill.execute(
+      { objectPath: "a/kick.wav.asd", sourceSha256: "abc123" },
+      context,
+    );
+    const remote = ssh.argv().at(-1) ?? "";
+    // Every word is shQuoted, so assert on the quoted form the shell sees.
+    assertStringIncludes(remote, "'hashsum' 'sha256'");
+    assertStringIncludes(remote, "'--download'");
+    assert(!remote.includes("sha256sum"));
+  } finally {
+    ssh.cleanup();
+  }
+});
+
 Deno.test("restoreDrill refuses an object above the byte ceiling", async () => {
   const ssh = await fakeSsh(`echo '{"count":1,"bytes":9999999999999}'`);
   const { context } = testContext(baseArgs(ssh.path, { maxRestoreBytes: 1024 }));
