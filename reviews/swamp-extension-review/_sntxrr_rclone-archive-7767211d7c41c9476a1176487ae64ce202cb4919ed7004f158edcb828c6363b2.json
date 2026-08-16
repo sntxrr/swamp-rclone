@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/rclone-archive",
+  "version": "2026.08.16.2",
+  "reviewedAt": "2026-08-16T18:00:10.328251Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "Unchanged by this release and re-checked against it. The new sizing runs through runRclone with NO_CREDENTIALS, so buildDuScript never has a secret in scope; it is also entrypoint sh, which means the arg vector is a script body and worth confirming carries nothing sensitive -- it does not, it references only /data. accessKeyId remains .meta({ sensitive: true }). The redactSecrets path and the FIFO env transport are untouched."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Unchanged. The pack-planning log still reports derived chunk size and concurrency per pack, which is what makes the part-10000 ceiling diagnosable; this release does not alter what is logged. Note the sizing script sends du/find stderr to /dev/null by design -- see error-handling for the consequence."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "rclone exit-code classification is untouched. One LIMITATION introduced here and recorded deliberately: buildDuScript discards du stderr and falls back to t=0, so a top-level directory the container cannot read sizes to 0 rather than failing. It then yields a pack planned at 0 bytes, which picks the 5 MiB default chunk and would die at part 10000 if that directory is large. The prior code was not better -- it emitted no line at all, so the directory was silently omitted from the archive entirely -- so this is a change of failure mode, not a regression. Making an unreadable entry mark the whole transfer inconclusive is the correct fix and is larger than this change; it is not done here."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "117 tests, up from 110, exit status confirmed. Eight are new and each pins a regression that had already occurred rather than a hypothetical: parseDu must KEEP '.' (its loss is what made _root unreachable); parseDu must strip the trailing slash the directory glob adds; the sizing script must glob directories only and must never use the bare /data glob; it must subtract every NEVER_ARCHIVE name and must -prune; the loose total must round up; the _root pack must not contain -cf - '.'; a normal pack must not gain --no-recursion. The exclusion tests assert the tar spelling has no /** and the rclone spelling does, which is the asymmetry most likely to be 'tidied' into a bug later."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "copy-never-sync and the nine refused subcommands are untouched. Pack NAMES are unchanged by this release -- the fix alters what goes INSIDE _root.tar and how entries are sized, not how any object is named -- so a re-push after upgrading does not re-upload existing packs or restart any 180-day minimum. That property was checked explicitly because the PRD makes stable naming the reason grouping was rejected."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Strengthened here. Every busybox behaviour this release depends on was verified by running it in the real rclone/rclone image rather than inferred: du -skb reports KILOBYTES (-k governs the unit, -b only makes it apparent -- a 102400-byte file reports 100 under -skb and 102400 under -sb), busybox tar accepts --no-recursion, and busybox find/xargs support -print0/-0/-r. The tar exclusion is a bare name because tar matches at any depth, while the rclone filter needs /** -- both spellings are asserted."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Unchanged: the remote temp dir trap and the FIFO writer kill path are untouched. The sizing script adds no temp files and streams nothing; the pack path still stages nothing on the NAS, which is the constraint that made streaming mandatory."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Shipped surface is still rclone_archive.ts, README.md, LICENSE.md and manifest.yaml, test file excluded. Re-audited the new prose for real identifiers: the only ones present are the three the owner approved for the public repo. Measured figures added to comments (296 MiB, 0.003%) are aggregates and disclose no share names."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Untouched. GlobalArgsSchema gained no fields -- that is precisely why the upgrade entry is a no-op -- and all four resource specs keep their zod v4 schemas."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "Untouched: four specs, lifetime infinite, garbageCollection 50."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "na",
+      "note": "Still deliberately not a CRUD model; this release adds no methods. It is a cost-ordered verification ladder over a destination it must never mutate destructively."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "The three existing checks are untouched and still correct. The source-path-absolute check matters more after this change, not less: the sizing script now globs /data/*/ and a docker-created empty named volume would produce zero entries, which reads as an empty share rather than an error."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Untouched, and the distinctness test still passes. Object names are unaffected: _root keeps its name and only its contents change."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Untouched. Churn wiring still uses data.latest(<model>, <RESOURCE INSTANCE>). Worth noting that net-of-@eaDir sizing will produce a one-time step change in recorded bytes on the first run after upgrade, which may trip churnWarnFraction once; that is a true reading of a real change in what is archived, not a false alarm to suppress."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "Was na at first publish; now applicable and handled. 2026.08.16.1 is published, so this release adds an upgrades entry targeting 2026.08.16.2 that returns globalArguments unchanged, because no field was added, renamed, removed or retyped. Verified the push no longer emits the missing-upgrade warning. The one live instance sits at typeVersion 2026.08.15.1 and the entry applies to it, since upgrades are filtered by toVersion > typeVersion."
+    }
+  ]
+}
