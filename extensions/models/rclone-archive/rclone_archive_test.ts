@@ -1142,7 +1142,7 @@ esac`,
   const { context } = testContext(baseArgs(ssh.path));
   try {
     await model.methods.restoreDrill.execute(
-      { objectPath: "a/kick.wav.asd", sourceSha256: "abc123" },
+      { objectPath: "a/sample.bin", sourceSha256: "abc123" },
       context,
     );
     const remote = ssh.argv().at(-1) ?? "";

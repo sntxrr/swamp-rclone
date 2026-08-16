@@ -30,3 +30,9 @@ vaults/
 # Restore-drill scratch. A drill retrieves real archived content; that content
 # is production data and must never reach git.
 restore-drills/
+
+# Vault grants. A grant names the vault and the token holder it scopes, which
+# is a map of who can read which secret. Empty today, and ignored now rather
+# than after the first one is written — the sibling directories above are
+# ignored for the same reason.
+grants/

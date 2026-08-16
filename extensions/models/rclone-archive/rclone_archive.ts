@@ -742,9 +742,9 @@ export type PackUploadPlan =
  *
  * A pack is a tar on stdin, so its size is unknown and the auto-scaling never
  * applies: every pack was capped at 48 GiB. That is not a theoretical limit
- * here — `time-machine/sntxrr.sparsebundle` alone is 912 GiB, nineteen times
- * over, and it would have failed roughly 48 GiB into the upload rather than at
- * plan time. `buildPackPlan` already knows each pack's size, so the chunk size
+ * here — a single Time Machine sparsebundle on the NAS this was built against
+ * is 912 GiB, nineteen times over, and it would have failed roughly 48 GiB into
+ * the upload rather than at plan time. `buildPackPlan` already knows each pack's size, so the chunk size
  * can simply be derived from it.
  *
  * Concurrency is reduced before the pack is refused, because buffers are the
@@ -1024,7 +1024,12 @@ const GlobalArgsSchema = z.object({
   ),
   bucket: z.string().describe("Destination S3 bucket."),
   region: z.string().describe("Bucket region, e.g. us-west-2."),
-  accessKeyId: z.string().describe(
+  // Marked sensitive alongside the secret. An access key ID is an identifier
+  // rather than a credential, but it names the AWS account it belongs to, and
+  // there is no rung here that benefits from seeing it in a log or a resource
+  // snapshot. Redaction costs nothing; the alternative is a value that leaks
+  // by default and has to be noticed later.
+  accessKeyId: z.string().meta({ sensitive: true }).describe(
     "AWS access key ID. Needs only s3:PutObject, s3:GetObject, " +
       "s3:ListBucket and s3:RestoreObject — never s3:DeleteObject.",
   ),
@@ -1535,7 +1540,7 @@ async function pushPacked(
 
 export const model = {
   type: "@sntxrr/rclone/archive",
-  version: "2026.08.15.1",
+  version: "2026.08.16.1",
   globalArguments: GlobalArgsSchema,
 
   resources: {
