@@ -174,10 +174,9 @@ The first full copy does not run as a swamp method (PRD §5.1) — no cadence ge
 9.6 TB through a 6-hour timeout. It runs as a long-lived operator session under
 [`herdr`](https://herdr.dev), which manages persistent sessions on this fleet.
 
-> **Unverified.** herdr is installed under the `sntxrr` profile on the NAS but
-> its shell wiring has not been confirmed — everything in this section is the
-> intended procedure, not an observed one. Work through the preflight before
-> trusting it.
+> **Preflight verified 2026-08-16** against herdr 0.8.0 on the NAS; the results
+> are recorded inline below. The seed itself has still never been run, so §7.3
+> and §7.4 remain intended procedure rather than observed.
 
 ### 7.1 Preflight on the NAS
 
@@ -202,6 +201,20 @@ ssh <nas> 'command -v herdr || echo "not on PATH — use the absolute path"'
 ssh <nas> 'echo "$HOME"; ls -d "$HOME/.config/herdr" 2>/dev/null || echo "no config dir yet"'
 ```
 
+What those three returned, on herdr 0.8.0:
+
+1. Present at the absolute path above.
+2. **Not** on `PATH` — confirmed, so the warning stands: invoke it absolutely.
+3. `HOME` is `/var/services/homes/sntxrr`, **not** the `/volume1` path. That is
+   DSM's service symlink and it resolves to `/volume1/homes/sntxrr`, so both
+   spellings reach the same directory and the User Home service is enabled. The
+   socket lands at `$HOME/.config/herdr/herdr.sock`.
+
+One thing the list did not cover: `herdr --help` advertises only `server stop`
+and `server reload-config`, which reads as though bare `herdr server` were not a
+command. It is — `herdr server --help` describes the group as "Run or control
+the headless server", and the bare form is what runs it.
+
 ### 7.2 Making the server survive a reboot
 
 **DSM has no systemd.** A headless `herdr server` started by hand dies with the
@@ -212,6 +225,27 @@ is *Control Panel → Task Scheduler → Create → Triggered Task → Boot-up*,
 ```
 /volume1/homes/sntxrr/.local/bin/herdr server
 ```
+
+This cannot be created or inspected from the CLI — `synoschedtask` needs root
+and `sudo` on this box prompts for a password. It is a GUI step, and it is the
+one part of the preflight that has **not** been verified.
+
+**`nohup … &` is not enough to start it by hand.** Launched that way over SSH
+the server dies with the session — observed, not theorised. `setsid` is what
+makes it outlive the connection, after which it reparents to PID 1 and a fresh
+SSH session sees it running:
+
+```bash
+ssh <nas> 'setsid nohup /volume1/homes/sntxrr/.local/bin/herdr server \
+  >/tmp/herdr-server.log 2>&1 </dev/null & echo launched'
+
+# From a NEW connection — the point of the exercise:
+ssh <nas> '/volume1/homes/sntxrr/.local/bin/herdr status server'   # => running
+```
+
+Note that `herdr status server` reports `not running` for a moment after launch
+while the socket is still being created; check it from a second connection
+rather than concluding the start failed.
 
 Verify it survives before starting a two-week transfer, not after.
 

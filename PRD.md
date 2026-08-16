@@ -137,17 +137,29 @@ object-per-file efficiently. Small-file trees do not: Deep Archive bills 40 KB
 of overhead per object regardless of file size, so a share of 500 KB documents
 pays roughly 8% overhead before storing a byte, plus $0.05 per 1 000 PUTs.
 
-### 2.3 Recycle bins are never archived
+### 2.3 What is never archived
 
-Every DSM share carries a `#recycle` directory: the files a human already chose
-to delete. None of it is archived, at any rung.
+Two directory names are excluded at every rung: `#recycle` and `@eaDir`. They
+are excluded for **different reasons**, and keeping the two arguments separate
+is what stops the list growing into "things that look like junk".
 
-The case is not really about money, though the money is real — 705 GiB, **7.3%
-of everything otherwise in scope**, and one share measured **97.6% recycle
-bin**. The case is that Deep Archive bills a 180-day minimum per object and a
-recycle bin *churns*: it fills as people delete things and empties when someone
-clears it, so each run archives freshly-deleted files and pays six months for
-each, in perpetuity, for data whose defining property is that nobody wants it.
+**`#recycle` — deleted data.** Every DSM share carries one: the files a human
+already chose to delete. The case is not really about money, though the money is
+real — 705 GiB, **7.3% of everything otherwise in scope**, and one share
+measured **97.6% recycle bin**. The case is that Deep Archive bills a 180-day
+minimum per object and a recycle bin *churns*: it fills as people delete things
+and empties when someone clears it, so each run archives freshly-deleted files
+and pays six months for each, in perpetuity, for data whose defining property is
+that nobody wants it.
+
+**`@eaDir` — derived data.** DSM's thumbnail and index sidecars, which the NAS
+regenerates on its own. This one is *not* a size argument, and the measurement
+is worth recording so nobody re-opens it expecting savings: across this volume
+`@eaDir` totals **296 MiB, 0.003% of everything in scope** — against the recycle
+bin's 705 GiB. Nearly all of it is one share (282 MiB), and the 3.8 TB media
+share holds 33 KiB. It is excluded because an archive of last resort should not
+carry a cache that the source rebuilds for free, not because it costs anything
+to keep.
 
 The exclusion is applied at **every** rung that counts or moves bytes — `scan`,
 `push`, `verify`, and both the sizing and the tar of the packing path. That
@@ -156,10 +168,13 @@ from `verify`, and `verify` compares a filtered destination against an
 unfiltered source and reports a permanent, meaningless delta — which trains
 whoever reads it to ignore the rung that exists to catch real drift.
 
-The list is deliberately short, and holds only what is definitionally not worth
-archiving. `@eaDir` — DSM's regenerable thumbnail and index sidecars — is a
-defensible addition on the same logic and is **not** currently excluded; it is a
-separate decision, not an oversight.
+The two names differ in **shape**, and the sizing path has to respect that.
+`#recycle` exists only at a share root, so dropping it from the pack plan is
+enough. `@eaDir` sits beside every indexed directory at any depth, so nothing
+top-level can catch it — and busybox `du` has no exclude of any kind. Sizing
+therefore measures each entry, measures the excluded subtrees beneath it, and
+subtracts. Skipping that step corrupts nothing, but it feeds the chunk-size
+choice and would make the guarantee above false in the one place nobody looks.
 
 ## 3. Cost model
 
@@ -214,6 +229,27 @@ The cost is granularity: restoring one file means retrieving its whole pack. For
 an archive of last resort that is the right trade — but it is a trade, so `scan`
 records the strategy it chose and why, and `restoreDrill` on a packed share must
 extract a *single member* from the pack to prove the packing is reversible.
+
+#### The `_root` pack
+
+Loose files sitting directly in a share root belong to no top-level directory,
+so they are collected into one `_root` pack. Two things about it are easy to get
+wrong, and both were wrong until measured against the real NAS:
+
+**`_root` is not `tar .`.** Tarring the share root archives every directory that
+already has a pack of its own, making `_root.tar` a second full copy of the
+share. On a small share that upload *succeeds*, and the share is stored twice at
+the 180-day minimum; on a large one it fails, but only after moving terabytes,
+because `_root` is sized from the loose-file total and so picks chunks for a few
+kilobytes and dies at part 10 000. The pack is built with `--no-recursion` over
+an explicit glob instead: files whole, directories as bare entries.
+
+**Loose files must not also be entries.** Sizing globs directories only. With a
+bare glob each loose file is reported as its own entry and becomes its own
+single-file object — one 40 KB overhead and one PUT each, which is the exact
+cost packing exists to amortise. Seven of the in-scope shares have loose files
+at their root; the share used for the restore drill has none, which is why the
+drill passed without exercising any of this.
 
 ## 5. Where it runs
 

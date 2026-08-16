@@ -18,10 +18,13 @@ import {
   parseDu,
   parseSize,
   projectCost,
+  buildDuScript,
   buildPackPlan,
   buildPackScript,
   planPackUpload,
   excludeFlags,
+  NEVER_ARCHIVE,
+  ROOT_PACK_MEMBER,
   PACK_PART_BUDGET,
   S3_DEFAULT_CHUNK_BYTES,
   S3_MAX_UPLOAD_PARTS,
@@ -598,6 +601,90 @@ Deno.test("no _root pack is created when the share root has no loose files", () 
   assertEquals(buildPackPlan([{ name: "homes", bytes: 5 }], 0).length, 1);
 });
 
+Deno.test("parseDu KEEPS '.', or the _root pack is unreachable", () => {
+  // Regression. The sizing script reports the loose-file total as `/data/.`;
+  // parseDu used to map that to "." and then drop it by its own guard, so
+  // looseFileBytes was permanently 0 and buildPackPlan never emitted _root.
+  // The loose files were still archived — but one S3 object EACH, which is
+  // precisely the per-object overhead the pack strategy exists to avoid.
+  const out = parseDu("500\t/data/docs/\n2\t/data/.\n");
+  const loose = out.find((e) => e.name === ".");
+  assert(loose, "the loose-file total must survive parseDu");
+  assertEquals(loose?.bytes, 2 * 1024);
+});
+
+Deno.test("parseDu strips the trailing slash the directory glob produces", () => {
+  // The script globs `/data/*/` to get directories ONLY, so du echoes a
+  // trailing slash. Left on, the name fails to match NEVER_ARCHIVE and lands
+  // in the object name as `homes/.tar`.
+  assertEquals(parseDu("4096\t/data/homes/\n"), [
+    { name: "homes", bytes: 4096 * 1024 },
+  ]);
+  assertEquals(parseDu("12\t/data/Resilio Sync/\n")[0].name, "Resilio Sync");
+});
+
+Deno.test("the sizing script globs directories only, never bare /data/*", () => {
+  // With the bare glob a loose root file is reported as its own entry, becomes
+  // its own single-file pack, AND is counted again inside _root.
+  const script = buildDuScript();
+  assertStringIncludes(script, "for d in /data/*/; do");
+  assertEquals(script.includes("du -skb /data/* "), false);
+});
+
+Deno.test("the sizing script subtracts every NEVER_ARCHIVE name", () => {
+  // du has no exclude in busybox, so the only way sizing can agree with what
+  // tar streams is to measure the entry and subtract the excluded subtrees.
+  const script = buildDuScript();
+  for (const name of NEVER_ARCHIVE) {
+    assertStringIncludes(script, `-name '${name}'`);
+  }
+  // -prune, or find descends into an excluded tree and double-counts nested
+  // copies of the same directory name.
+  assertStringIncludes(script, "-type d -prune");
+  // Never let a subtraction drive the estimate negative.
+  assertStringIncludes(script, '[ "$n" -lt 0 ] && n=0');
+});
+
+Deno.test("the loose-file total rounds UP, so small files still get a _root pack", () => {
+  // `du -skb` reports 0 for anything under 1024 bytes. A 0 here means no
+  // _root pack, and a share root of nothing but small files loses them.
+  const script = buildDuScript();
+  assertStringIncludes(script, "k=int((s+1023)/1024); if (k<1) k=1");
+});
+
+Deno.test("the _root pack does NOT tar the whole share", () => {
+  // The expensive bug. `tar -cf - .` archives every directory that already has
+  // a pack of its own, so _root.tar is a second full copy of the share: it
+  // either succeeds and stores the share twice at Deep Archive's 180-day
+  // minimum, or — because _root is sized from the loose-file total — picks
+  // chunks for a few KiB and dies at part 10 000 having moved terabytes.
+  const script = buildPackScript(
+    ROOT_PACK_MEMBER,
+    "dest:b/x/_root.tar",
+    "DEEP_ARCHIVE",
+    smallUpload(),
+  );
+  assertStringIncludes(script, "--no-recursion");
+  assertStringIncludes(script, "./*");
+  assertEquals(script.includes("-cf - '.'"), false);
+  // The cd is not interchangeable with -C: -C positions tar, but the glob is
+  // expanded by the SHELL, so with -C alone `./*` expands in the wrong place
+  // and tar reports "./*: No such file or directory".
+  assertStringIncludes(script, "cd /data && tar");
+});
+
+Deno.test("a normal pack still tars its member, not the share root", () => {
+  const script = buildPackScript(
+    "homes",
+    "dest:b/x/homes.tar",
+    "DEEP_ARCHIVE",
+    smallUpload(),
+  );
+  assertStringIncludes(script, "tar -C /data ");
+  assertStringIncludes(script, "-cf - 'homes'");
+  assertEquals(script.includes("--no-recursion"), false);
+});
+
 /** A streamable plan for a small pack, for tests that do not care about size. */
 function smallUpload() {
   const plan = planPackUpload(1024);
@@ -605,13 +692,22 @@ function smallUpload() {
   return plan;
 }
 
-Deno.test("the recycle bin is excluded, unanchored so it matches at any depth", () => {
+Deno.test("the recycle bin and @eaDir are excluded, unanchored so they match at any depth", () => {
   const flags = excludeFlags();
-  assertEquals(flags, ["--exclude", "#recycle/**"]);
+  assertEquals(flags, [
+    "--exclude",
+    "#recycle/**",
+    "--exclude",
+    "@eaDir/**",
+  ]);
   // Unanchored on purpose: a nested recycle bin is exactly as unwanted as a
   // top-level one. This is the opposite of buildRestoreArgs, where a loose
   // filter would retrieve and bill for every same-named object in the share.
-  assertEquals(flags[1].startsWith("/"), false);
+  // For @eaDir it is not defence but necessity — DSM writes one beside every
+  // indexed directory, so an anchored filter would match none of them.
+  for (const f of flags.filter((_, i) => i % 2 === 1)) {
+    assertEquals(f.startsWith("/"), false);
+  }
 });
 
 Deno.test("a recycle bin never becomes its own pack", () => {
@@ -635,6 +731,10 @@ Deno.test("the pack script excludes the recycle bin from the tar itself", () => 
     smallUpload(),
   );
   assertStringIncludes(script, "--exclude '#recycle'");
+  assertStringIncludes(script, "--exclude '@eaDir'");
+  // Unlike the rclone filters these carry no `/**` — tar matches a bare name
+  // at any depth, and `@eaDir/**` would match nothing.
+  assertEquals(script.includes("'@eaDir/**'"), false);
   // Before the member, or tar treats it as a file to add rather than a filter.
   assertEquals(script.indexOf("--exclude") < script.indexOf("-cf -"), true);
   // The flag itself is not quoted — the operator copies this command by hand.

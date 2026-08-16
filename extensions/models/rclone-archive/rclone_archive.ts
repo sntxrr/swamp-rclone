@@ -114,17 +114,26 @@ export const DEFAULT_PACK_MEMORY_BUDGET_BYTES = 1024 * MIB;
  * bin**. Worse, it churns: a recycle bin fills and empties continuously, so
  * every run replaces objects that are still being billed for six months.
  *
- * This list is deliberately narrow. It holds things that are definitionally not
- * worth archiving, not things that merely look like junk — `@eaDir` (DSM's
- * regenerable thumbnail and index sidecars) is a defensible addition but is a
- * separate decision, and is NOT excluded here.
+ * `@eaDir` is DSM's per-directory thumbnail and index sidecar. It is excluded
+ * on a different basis from `#recycle`, and the difference is worth stating so
+ * the list does not drift into "things that look like junk": `@eaDir` is
+ * **derived data the source regenerates on its own**, so archiving it stores
+ * something no restore needs. The bytes are not the argument — measured across
+ * this volume `@eaDir` is 296 MiB, 0.003% of everything in scope, against the
+ * recycle bin's 705 GiB — but neither is there a reason to pay Deep Archive's
+ * 180-day minimum for a cache.
  *
  * Applied at EVERY rung that counts or moves bytes. That consistency is the
  * whole point: exclude it from `push` but not from `verify`, and `verify`
  * compares a filtered destination against an unfiltered source and reports a
  * permanent, meaningless delta.
+ *
+ * The two names differ in SHAPE, which is what the sizing path has to respect.
+ * `#recycle` exists only at a share root, so dropping it from the pack plan is
+ * enough. `@eaDir` is nested at every level, so nothing top-level can catch it
+ * and {@link buildDuScript} has to subtract it per entry.
  */
-export const NEVER_ARCHIVE = ["#recycle"];
+export const NEVER_ARCHIVE = ["#recycle", "@eaDir"];
 
 /**
  * rclone filter flags for {@link NEVER_ARCHIVE}.
@@ -133,8 +142,11 @@ export const NEVER_ARCHIVE = ["#recycle"];
  * is the opposite of the choice `buildRestoreArgs` makes, and for the opposite
  * reason: there, a loose filter would retrieve every same-named object in the
  * share and bill for it; here, a nested recycle bin is exactly as unwanted as a
- * top-level one. DSM only creates `#recycle` at a share root today, so this is
- * defence rather than a known case.
+ * top-level one.
+ *
+ * For `#recycle` that is still defence — DSM only creates one at a share root.
+ * For `@eaDir` it is the whole point: DSM puts one beside every directory it
+ * has indexed, so an anchored filter would match none of them.
  */
 export function excludeFlags(): string[] {
   return NEVER_ARCHIVE.flatMap((name) => ["--exclude", `${name}/**`]);
@@ -640,6 +652,14 @@ export function churnFraction(
   return Math.abs(currentBytes - previousBytes) / previousBytes;
 }
 
+/**
+ * The `member` value marking the pack that holds the share root's loose files.
+ *
+ * It is `"."` because that is the share root, but it does NOT mean "tar the
+ * share root" — see {@link buildPackScript}, which has to treat it specially.
+ */
+export const ROOT_PACK_MEMBER = ".";
+
 /** One tar object to be produced from the share. */
 export interface Pack {
   /** Object name at the destination, without the .tar suffix. */
@@ -653,11 +673,17 @@ export interface Pack {
 }
 
 /**
- * Parse `du -sk /data/*` output into entries relative to the share root.
+ * Parse the output of {@link buildDuScript} into entries relative to the share
+ * root.
  *
  * busybox `du` emits "<kilobytes>\t<path>". Splitting on the FIRST tab matters:
  * a directory name may contain a tab, and splitting on whitespace would break
  * every directory name containing a space — of which volume1 has several.
+ *
+ * The units are KILOBYTES even though the script passes `du -skb`. `-b` is the
+ * apparent-size flag; `-k` still governs the unit, and the two compose rather
+ * than conflict. Verified in the rclone image: a 102 400-byte file reports
+ * `100` under `-skb` and `102400` under `-sb`.
  */
 export function parseDu(
   stdout: string,
@@ -669,12 +695,66 @@ export function parseDu(
     const kb = Number(line.slice(0, tab).trim());
     const path = line.slice(tab + 1);
     if (!Number.isFinite(kb) || path.length === 0) continue;
-    // Entries arrive as /data/<name>; keep only the leaf.
-    const name = path.replace(/^\/data\/?/, "");
-    if (name.length === 0 || name === ".") continue;
+    // Entries arrive as /data/<name>; keep only the leaf. The directory glob is
+    // `/data/*/`, so du echoes a TRAILING SLASH that has to come off before the
+    // name is compared against NEVER_ARCHIVE or used as an object name.
+    const name = path.replace(/^\/data\/?/, "").replace(/\/+$/, "");
+    // "." is KEPT. It is how the script reports the share root's loose-file
+    // total, and dropping it here is what made the `_root` pack unreachable:
+    // the producer emitted `/data/.`, this guard deleted it, `looseFileBytes`
+    // was therefore always 0, and buildPackPlan never emitted the pack. Callers
+    // filter "." out of the pack entries themselves.
+    if (name.length === 0) continue;
     out.push({ name, bytes: kb * 1024 });
   }
   return out;
+}
+
+/**
+ * The shell that measures one share: net apparent size per top-level directory,
+ * plus the loose files sitting in the share root.
+ *
+ * Three things here are load-bearing and none are obvious.
+ *
+ * **The glob carries a TRAILING SLASH**, which restricts it to DIRECTORIES.
+ * With the bare `/data` glob a loose file in the share root is reported as its
+ * own entry and becomes its own single-file pack — one S3 object per loose
+ * file, each paying the 40 KB overhead and a PUT, which is exactly the cost the
+ * pack strategy exists to amortise. Worse, once `_root` works it is counted a
+ * second time there, and the same bytes are archived twice.
+ *
+ * **`@eaDir` is subtracted per entry.** `du` has no exclude of any kind in
+ * busybox, so the only way to make the sizing agree with what `tar` will
+ * actually stream is to measure the entry, measure the excluded directories
+ * beneath it, and subtract. Skipping this does not corrupt anything — the
+ * estimate is merely too big — but it feeds {@link planPackUpload}, which picks
+ * a chunk size from it, and it makes the "excluded at every rung" guarantee a
+ * lie in the one place nobody would look.
+ *
+ * **The loose-file total rounds UP to a whole KiB.** `du -skb` reports 0 for
+ * anything under 1 024 bytes, and a 0 there means {@link buildPackPlan} emits
+ * no `_root` pack at all — so a share root holding nothing but small files
+ * would have them silently dropped from the archive. The ceiling is what makes
+ * "there are loose files" and "looseFileBytes > 0" the same statement.
+ */
+export function buildDuScript(): string {
+  const names = NEVER_ARCHIVE.map((n) => `-name ${shQuote(n)}`).join(" -o ");
+  return [
+    "set -e",
+    "for d in /data/*/; do",
+    '  [ -d "$d" ] || continue',
+    "  t=$(du -skb \"$d\" 2>/dev/null | awk '{print $1; exit}')",
+    `  e=$(find "$d" \\( ${names} \\) -type d -prune -print0 2>/dev/null ` +
+    "| xargs -0 -r du -skb 2>/dev/null | awk '{s+=$1} END {print s+0}')",
+    '  [ -n "$t" ] || t=0',
+    '  n=$((t - e)); [ "$n" -lt 0 ] && n=0',
+    '  printf \'%s\\t%s\\n\' "$n" "$d"',
+    "done",
+    "printf '%s\\t/data/.\\n' \"$(find /data -maxdepth 1 -type f " +
+    "-exec du -sb {} + 2>/dev/null | awk '{s+=$1; n++} END " +
+    "{ if (n==0) { print 0 } else { k=int((s+1023)/1024); if (k<1) k=1; " +
+    "print k } }')\"",
+  ].join("\n");
 }
 
 /**
@@ -693,7 +773,10 @@ export function parseDu(
  * archive is written far more often than it is read.
  *
  * Loose files in the share root are collected into a single `_root` pack so
- * they are neither skipped nor turned into one object each.
+ * they are neither skipped nor turned into one object each. `entries` must
+ * therefore contain DIRECTORIES ONLY — see {@link buildDuScript}, which is what
+ * guarantees it — or a loose file is archived both on its own and inside
+ * `_root`.
  */
 export function buildPackPlan(
   entries: Array<{ name: string; bytes: number }>,
@@ -710,7 +793,11 @@ export function buildPackPlan(
     .sort((a, b) => a.name.localeCompare(b.name));
 
   if (looseFileBytes > 0) {
-    packs.push({ name: "_root", member: ".", bytes: looseFileBytes });
+    packs.push({
+      name: "_root",
+      member: ROOT_PACK_MEMBER,
+      bytes: looseFileBytes,
+    });
   }
   return packs;
 }
@@ -808,6 +895,28 @@ export function planPackUpload(
  * vanishing mid-read — still exits 0, and rclone faithfully uploads the
  * truncated stream as a complete object. That is the worst failure mode
  * available here: a backup that reports success and cannot be restored.
+ *
+ * ## The `_root` pack is not `tar .`
+ *
+ * {@link ROOT_PACK_MEMBER} needs its own tar invocation, and getting this wrong
+ * is expensive rather than merely untidy. `tar -cf - .` archives the share
+ * ENTIRE — every directory that already has a pack of its own — so `_root.tar`
+ * becomes a second full copy of the share. Two ways that bites:
+ *
+ *   - On a small share the duplicate upload SUCCEEDS, and the share sits in
+ *     Deep Archive twice, both copies held to the 180-day minimum.
+ *   - On a large one it fails, but only after moving terabytes: `_root`'s size
+ *     is the loose-file total, so {@link planPackUpload} sizes the chunks for a
+ *     few kilobytes and the stream dies at part 10 000 — the same unknown-size
+ *     ceiling documented on that function, reached from the other direction.
+ *
+ * `--no-recursion` with an explicit `./*` glob is the fix: files are archived
+ * whole, directories are archived as bare entries without their contents. The
+ * `cd` is required and is not the same as `-C` — `-C` positions tar, but the
+ * glob is expanded by the SHELL, so with `-C` alone `./*` expands in whatever
+ * directory the shell started in and tar reports "./*: No such file or
+ * directory". The glob also survives names containing spaces, which `volume1`
+ * has, because shell globbing does not word-split its results.
  */
 export function buildPackScript(
   member: string,
@@ -815,10 +924,13 @@ export function buildPackScript(
   storageClass: string,
   upload: Extract<PackUploadPlan, { streamable: true }>,
 ): string {
+  const tar = member === ROOT_PACK_MEMBER
+    ? `cd /data && tar ${tarExcludeArgs()} --no-recursion -cf - ./*`
+    : `tar -C /data ${tarExcludeArgs()} -cf - ${shQuote(member)}`;
   return [
     "set -e",
     "set -o pipefail",
-    `tar -C /data ${tarExcludeArgs()} -cf - ${shQuote(member)} | rclone rcat ` +
+    `${tar} | rclone rcat ` +
     `${shQuote(destination)} --s3-storage-class ${shQuote(storageClass)} ` +
     `--s3-chunk-size ${shQuote(String(upload.chunkBytes))} ` +
     `--s3-upload-concurrency ${shQuote(String(upload.uploadConcurrency))}`,
@@ -1384,16 +1496,14 @@ async function pushPacked(
   // number picks too small a chunk size, and the upload then dies at part
   // 10 000 having transferred terabytes. Apparent size predicts the same tar
   // to within 2 560 bytes.
+  //
+  // The script itself is in buildDuScript, so it can be tested without a
+  // container. Everything subtle about it is documented there.
   const duRun = await runRclone(
     NO_CREDENTIALS,
     destination,
     { ...transport, entrypoint: "sh" },
-    [
-      "-c",
-      "set -e\ndu -skb /data/* 2>/dev/null || true\n" +
-      'echo "$(find /data -maxdepth 1 -type f -exec du -kb {} + 2>/dev/null | ' +
-      "awk '{s+=$1} END {print s+0}')\t/data/.\"",
-    ],
+    ["-c", buildDuScript()],
   );
 
   const entries = parseDu(duRun.stdout);
@@ -1540,8 +1650,22 @@ async function pushPacked(
 
 export const model = {
   type: "@sntxrr/rclone/archive",
-  version: "2026.08.16.1",
+  version: "2026.08.16.2",
   globalArguments: GlobalArgsSchema,
+
+  // No-op: this release changes what gets EXCLUDED and how a pack is sized and
+  // tarred, none of which touches globalArguments. The entry still has to exist
+  // — without one an existing instance keeps its old typeVersion forever and
+  // never picks the new behaviour up.
+  upgrades: [
+    {
+      toVersion: "2026.08.16.2",
+      description:
+        "Exclude @eaDir; size packs net of excluded subtrees; stop the _root " +
+        "pack tarring the whole share. No globalArguments changes.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
 
   resources: {
     "inventory": {
