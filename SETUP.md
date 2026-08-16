@@ -220,34 +220,49 @@ the headless server", and the bare form is what runs it.
 **DSM has no systemd.** A headless `herdr server` started by hand dies with the
 next reboot, and a seed that takes two weeks will meet one. Persistence on DSM
 is *Control Panel → Task Scheduler → Create → Triggered Task → Boot-up*, run as
-`sntxrr`, with the absolute path:
+`sntxrr`. **Created 2026-08-16**, named `herdr server`, owner `sntxrr`, enabled.
+
+It has to be created in the GUI: `synoschedtask` needs root and `sudo` on this
+box prompts for a password, so there is no scripted path to it.
+
+**The task body is not the bare command.** The obvious contents —
 
 ```
 /volume1/homes/sntxrr/.local/bin/herdr server
 ```
 
-This cannot be created or inspected from the CLI — `synoschedtask` needs root
-and `sudo` on this box prompts for a password. It is a GUI step, and it is the
-one part of the preflight that has **not** been verified.
-
-**`nohup … &` is not enough to start it by hand.** Launched that way over SSH
-the server dies with the session — observed, not theorised. `setsid` is what
-makes it outlive the connection, after which it reparents to PID 1 and a fresh
-SSH session sees it running:
+— are wrong in two ways, and both were observed rather than reasoned about:
 
 ```bash
-ssh <nas> 'setsid nohup /volume1/homes/sntxrr/.local/bin/herdr server \
-  >/tmp/herdr-server.log 2>&1 </dev/null & echo launched'
-
-# From a NEW connection — the point of the exercise:
-ssh <nas> '/volume1/homes/sntxrr/.local/bin/herdr status server'   # => running
+export HOME=/var/services/homes/sntxrr
+setsid nohup /volume1/homes/sntxrr/.local/bin/herdr server \
+  >/tmp/herdr-server.log 2>&1 </dev/null &
 ```
 
-Note that `herdr status server` reports `not running` for a moment after launch
-while the socket is still being created; check it from a second connection
-rather than concluding the start failed.
+`setsid` is what makes the daemon outlive its parent. The scheduler runs the
+script and then tears down its process group, exactly as `ssh host 'cmd &'`
+does — a plain `nohup … &` server dies with the session, observed both ways.
+`setsid` puts it in a new session, after which it reparents to PID 1 and
+survives. Verified by running the task from Task Scheduler with the server
+stopped, then confirming from a shell:
 
-Verify it survives before starting a two-week transfer, not after.
+```
+sntxrr  31064  1  /volume1/homes/sntxrr/.local/bin/herdr server
+```
+
+The `1` in the PPID column is the whole point of the exercise.
+
+`HOME` is set explicitly because the socket path derives from it
+(`$HOME/.config/herdr/herdr.sock`), and a boot-time task should not depend on
+the shell having resolved a home directory the way an interactive login does.
+
+Note that `herdr status server` reports `not running` for a moment after launch
+while the socket is still being created; check it again rather than concluding
+the start failed.
+
+**Still unproven: that the Boot-up trigger fires at boot.** Running the task by
+hand proves the script, not the trigger. That last step needs an actual reboot,
+which has not been done.
 
 ### 7.3 Running the seed
 
