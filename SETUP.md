@@ -260,9 +260,26 @@ Note that `herdr status server` reports `not running` for a moment after launch
 while the socket is still being created; check it again rather than concluding
 the start failed.
 
-**Still unproven: that the Boot-up trigger fires at boot.** Running the task by
-hand proves the script, not the trigger. That last step needs an actual reboot,
-which has not been done.
+**The Boot-up trigger is proven.** `sinner` was rebooted 2026-08-16 (from 27 days
+of uptime) and the server came back unattended:
+
+```
+sntxrr  17427  1  /volume1/homes/sntxrr/.local/bin/herdr server
+status: running
+```
+
+The PID differs from the pre-reboot process, so this is a new one rather than a
+survivor, and `/tmp/herdr-server.log` was rewritten — `/tmp` is cleared on boot,
+so that file could only have come from the task. **The preflight is complete.**
+
+Two things to expect from a reboot of this NAS, neither related to herdr:
+
+- DSM takes roughly **five minutes** to answer SSH again, and container recovery
+  runs well behind that. Nothing has failed at the two-minute mark; load average
+  is still in double digits then.
+- `Code-Server` is the one container set to `restart=on-failure`, which Docker
+  does not reliably restart after a *clean* shutdown. Everything else on the box
+  is `unless-stopped` or `always`. Start it by hand if you want it.
 
 ### 7.3 Running the seed
 
