@@ -36,8 +36,8 @@ this suite is what protects it.**
 
 ## 2. Scope
 
-**In:** all of volume1 except `appliance-backups` — **10.4 TB across 18 shares**
-— copied to S3 Glacier Deep Archive, on a schedule, driven from the existing
+**In:** all of volume1 except `appliance-backups`, and excluding every share's
+recycle bin — **9.6 TB across 18 shares** — copied to S3 Glacier Deep Archive, on a schedule, driven from the existing
 `swamp serve` instance on the `docker` host, with credentials from 1Password
 Connect.
 
@@ -56,12 +56,12 @@ Prometheus/Grafana stack rather than only in `swamp data query` (§6).
 **Out:**
 
 - Restoring the NAS. This suite proves a restore is *possible* and drills it on
-  a sample; a full 10.4 TB recovery is an operator runbook, not a model method.
+  a sample; a full 9.6 TB recovery is an operator runbook, not a model method.
 - Managing the AWS side — bucket creation, lifecycle rules, IAM. That is
   `@swamp/aws/s3` territory; this suite consumes a bucket it did not create.
 - Replacing restic. The two coexist: restic covers the Linux fleet to B2, this
   covers the NAS to Glacier.
-- **The initial seed.** Moving the first 10.4 TB is explicitly *not* a swamp
+- **The initial seed.** Moving the first 9.6 TB is explicitly *not* a swamp
   method (§5.1). swamp owns the steady state; the seed is an operator job.
 - **`appliance-backups`.** Removed from scope after measurement; see §2.1. It is
   4.7 TB on disk but **1 015 TB to read**, and no bandwidth makes that finish.
@@ -117,37 +117,62 @@ and sizes is a complete contents inventory of the volume this suite exists to
 protect. The sizes and proportions are real, because the design decisions
 follow from them.
 
-Sizes are apparent, per §2.
+Sizes are apparent and net of recycle bins, per §2 and §2.3. Rows are rounded
+independently, so they do not sum exactly.
 
 | Share | Size | Shape |
 | ----- | ---: | ----- |
 | `media-library` | 3.8 T | large media files — ideal Glacier shape |
 | `homes` | 2.7 T | **the irreplaceable data**; mixed sizes, many small |
-| `mac-backups` | 1.5 T | ~157 k churning 8 MB bands |
 | `vm-dumps` | 1.3 T | sparse VM images — 0.5 T on disk |
-| `home-automation` | 0.5 T | small files, frequent writes |
+| `mac-backups` | 1.3 T | ~157 k churning 8 MB bands |
 | `video-originals` | 0.4 T | large video originals |
-| twelve small shares | 0.1 T | mixed |
-| **total** | **10.4 T** | |
+| thirteen small shares | 0.2 T | mixed |
+| **total** | **9.6 T** | |
 | ~~`appliance-backups`~~ | ~~1 015 T~~ | **out of scope (§2.1)** — 4.7 T on disk, 216x on read |
+| ~~recycle bins~~ | ~~0.7 T~~ | **never archived (§2.3)** — deleted files |
 
 Two distinct shapes, needing two strategies (§4). Large-file shares copy
 object-per-file efficiently. Small-file trees do not: Deep Archive bills 40 KB
 of overhead per object regardless of file size, so a share of 500 KB documents
 pays roughly 8% overhead before storing a byte, plus $0.05 per 1 000 PUTs.
 
+### 2.3 Recycle bins are never archived
+
+Every DSM share carries a `#recycle` directory: the files a human already chose
+to delete. None of it is archived, at any rung.
+
+The case is not really about money, though the money is real — 705 GiB, **7.3%
+of everything otherwise in scope**, and one share measured **97.6% recycle
+bin**. The case is that Deep Archive bills a 180-day minimum per object and a
+recycle bin *churns*: it fills as people delete things and empties when someone
+clears it, so each run archives freshly-deleted files and pays six months for
+each, in perpetuity, for data whose defining property is that nobody wants it.
+
+The exclusion is applied at **every** rung that counts or moves bytes — `scan`,
+`push`, `verify`, and both the sizing and the tar of the packing path. That
+consistency is load-bearing rather than tidy: exclude it from `push` but not
+from `verify`, and `verify` compares a filtered destination against an
+unfiltered source and reports a permanent, meaningless delta — which trains
+whoever reads it to ignore the rung that exists to catch real drift.
+
+The list is deliberately short, and holds only what is definitionally not worth
+archiving. `@eaDir` — DSM's regenerable thumbnail and index sidecars — is a
+defensible addition on the same logic and is **not** currently excluded; it is a
+separate decision, not an oversight.
+
 ## 3. Cost model
 
 Storage is not the constraint. **Recovery is.**
 
-| Item | Rate | 10.4 TB |
-| ---- | ---- | -------: |
-| Deep Archive storage | $0.00099 / GB-mo | **$10.27 / mo** |
+| Item | Rate | 9.6 TB |
+| ---- | ---- | -----: |
+| Deep Archive storage | $0.00099 / GB-mo | **$9.52 / mo** |
 | Per-object overhead | 40 KB / object | ~$2.50 / mo per million objects |
 | Upload (PUT) | $0.05 / 1 000 | one-off, per object |
-| Retrieval — bulk (48 h) | $0.0025 / GB | $26 |
-| Retrieval — standard (12 h) | $0.02 / GB | $207 |
-| **Egress to internet** | **$0.09 / GB** | **$933** |
+| Retrieval — bulk (48 h) | $0.0025 / GB | $24 |
+| Retrieval — standard (12 h) | $0.02 / GB | $192 |
+| **Egress to internet** | **$0.09 / GB** | **$865** |
 
 Egress dominates every other line by an order of magnitude. A full recovery of
 the archive costs more in bandwidth than seven years of storing it. This is worth
@@ -221,7 +246,7 @@ a concurrency limit.** `--transfers`, `--s3-upload-concurrency` and
 `--s3-chunk-size` have no throughput to recover here, and an earlier note in
 this project claiming the ISP imposed no cap was simply wrong.
 
-So 10.4 TB takes **~17 days at the peak rate and ~23 days at the four-sample
+So 9.6 TB takes **~15 days at the peak rate and ~22 days at the four-sample
 mean**, and the honest planning figure is the latter. Tune those flags for
 memory safety (§5.2) if at all; do not expect them to buy time.
 
@@ -233,7 +258,7 @@ continued rather than restarted.
 
 **The seed must use the same flags the model would.** This is the one real
 hazard of stepping outside swamp: a hand-written command that omits
-`--s3-storage-class` lands 10.4 TB at S3 Standard rates — roughly $239/mo
+`--s3-storage-class` lands 9.6 TB at S3 Standard rates — roughly $221/mo
 against $10 — and nothing in rclone's output says so. The seed command is
 therefore *generated* by `push --input dryRun=true`, which runs the real code
 path and prints the exact invocation, rather than transcribed from memory.

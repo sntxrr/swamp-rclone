@@ -21,6 +21,7 @@ import {
   buildPackPlan,
   buildPackScript,
   planPackUpload,
+  excludeFlags,
   PACK_PART_BUDGET,
   S3_DEFAULT_CHUNK_BYTES,
   S3_MAX_UPLOAD_PARTS,
@@ -604,6 +605,42 @@ function smallUpload() {
   return plan;
 }
 
+Deno.test("the recycle bin is excluded, unanchored so it matches at any depth", () => {
+  const flags = excludeFlags();
+  assertEquals(flags, ["--exclude", "#recycle/**"]);
+  // Unanchored on purpose: a nested recycle bin is exactly as unwanted as a
+  // top-level one. This is the opposite of buildRestoreArgs, where a loose
+  // filter would retrieve and bill for every same-named object in the share.
+  assertEquals(flags[1].startsWith("/"), false);
+});
+
+Deno.test("a recycle bin never becomes its own pack", () => {
+  // Without this the share's deleted files are tarred into an object of their
+  // own and billed for Deep Archive's 180-day minimum.
+  const plan = buildPackPlan(
+    [
+      { name: "#recycle", bytes: 236_522_059_000 },
+      { name: "sntxrr.sparsebundle", bytes: 955_334_650_000 },
+    ],
+    0,
+  );
+  assertEquals(plan.map((p) => p.name), ["sntxrr.sparsebundle"]);
+});
+
+Deno.test("the pack script excludes the recycle bin from the tar itself", () => {
+  const script = buildPackScript(
+    "homes",
+    "dest:b/x/homes.tar",
+    "DEEP_ARCHIVE",
+    smallUpload(),
+  );
+  assertStringIncludes(script, "--exclude '#recycle'");
+  // Before the member, or tar treats it as a file to add rather than a filter.
+  assertEquals(script.indexOf("--exclude") < script.indexOf("-cf -"), true);
+  // The flag itself is not quoted — the operator copies this command by hand.
+  assertEquals(script.includes("'--exclude'"), false);
+});
+
 Deno.test("the pack script sets pipefail — without it a broken tar uploads truncated", () => {
   const script = buildPackScript(
     "homes",
@@ -614,7 +651,7 @@ Deno.test("the pack script sets pipefail — without it a broken tar uploads tru
   assertStringIncludes(script, "set -o pipefail");
   // Without pipefail the exit status is rclone's alone, so a tar that dies
   // halfway still exits 0 and the truncated stream is stored as complete.
-  assertStringIncludes(script, "tar -C /data -cf -");
+  assertStringIncludes(script, "tar -C /data");
   assertStringIncludes(script, "rclone rcat");
   assertStringIncludes(script, "--s3-storage-class");
 });

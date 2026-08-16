@@ -104,6 +104,53 @@ export const PACK_PART_BUDGET = 8_000;
  */
 export const DEFAULT_PACK_MEMORY_BUDGET_BYTES = 1024 * MIB;
 
+/**
+ * Directory names that are never archived, at any depth.
+ *
+ * `#recycle` is DSM's per-share recycle bin: the files a human already chose to
+ * delete. Archiving it means paying Deep Archive's 180-day minimum to keep
+ * deleted data, and it is not a rounding error — measured across this volume it
+ * is 705 GiB, 7.3% of everything in scope, and one share is **97.6% recycle
+ * bin**. Worse, it churns: a recycle bin fills and empties continuously, so
+ * every run replaces objects that are still being billed for six months.
+ *
+ * This list is deliberately narrow. It holds things that are definitionally not
+ * worth archiving, not things that merely look like junk — `@eaDir` (DSM's
+ * regenerable thumbnail and index sidecars) is a defensible addition but is a
+ * separate decision, and is NOT excluded here.
+ *
+ * Applied at EVERY rung that counts or moves bytes. That consistency is the
+ * whole point: exclude it from `push` but not from `verify`, and `verify`
+ * compares a filtered destination against an unfiltered source and reports a
+ * permanent, meaningless delta.
+ */
+export const NEVER_ARCHIVE = ["#recycle"];
+
+/**
+ * rclone filter flags for {@link NEVER_ARCHIVE}.
+ *
+ * Deliberately UNANCHORED — no leading slash — so it matches at any depth. That
+ * is the opposite of the choice `buildRestoreArgs` makes, and for the opposite
+ * reason: there, a loose filter would retrieve every same-named object in the
+ * share and bill for it; here, a nested recycle bin is exactly as unwanted as a
+ * top-level one. DSM only creates `#recycle` at a share root today, so this is
+ * defence rather than a known case.
+ */
+export function excludeFlags(): string[] {
+  return NEVER_ARCHIVE.flatMap((name) => ["--exclude", `${name}/**`]);
+}
+
+/**
+ * The same exclusions as a fragment of tar's command line.
+ *
+ * Only the VALUE is quoted. Quoting the flag too is harmless to sh but makes
+ * the generated command — which an operator copies by hand to run the seed
+ * (SETUP.md §7.3) — read like a mistake.
+ */
+export function tarExcludeArgs(): string {
+  return NEVER_ARCHIVE.map((name) => `--exclude ${shQuote(name)}`).join(" ");
+}
+
 /** Subcommands that remove data. This suite never deletes. */
 const FORBIDDEN = new Set([
   "sync",
@@ -654,6 +701,9 @@ export function buildPackPlan(
 ): Pack[] {
   const packs: Pack[] = entries
     .filter((e) => e.name !== ".")
+    // A recycle bin is a top-level entry, so without this it becomes its own
+    // pack — an object whose entire contents are files someone deleted.
+    .filter((e) => !NEVER_ARCHIVE.includes(e.name))
     .map((e) => ({ name: e.name, member: e.name, bytes: e.bytes }))
     // Sort for deterministic ordering — a plan that varies run to run is a
     // plan that cannot be compared against the previous run.
@@ -768,7 +818,7 @@ export function buildPackScript(
   return [
     "set -e",
     "set -o pipefail",
-    `tar -C /data -cf - ${shQuote(member)} | rclone rcat ` +
+    `tar -C /data ${tarExcludeArgs()} -cf - ${shQuote(member)} | rclone rcat ` +
     `${shQuote(destination)} --s3-storage-class ${shQuote(storageClass)} ` +
     `--s3-chunk-size ${shQuote(String(upload.chunkBytes))} ` +
     `--s3-upload-concurrency ${shQuote(String(upload.uploadConcurrency))}`,
@@ -1658,7 +1708,7 @@ export const model = {
           NO_CREDENTIALS,
           destinationOf(g),
           transportOf(g),
-          ["size", "/data", "--json"],
+          ["size", "/data", "--json", ...excludeFlags()],
         );
 
         const parsed = run.code === RCLONE_EXIT.OK
@@ -1823,7 +1873,7 @@ export const model = {
           credentialsOf(g),
           destinationOf(g),
           transportOf(g),
-          ["copy", "/data", dest, ...flags],
+          ["copy", "/data", dest, ...flags, ...excludeFlags()],
         );
 
         const nothing = run.code === RCLONE_EXIT.NO_TRANSFER;
@@ -1888,7 +1938,7 @@ export const model = {
           NO_CREDENTIALS,
           destinationOf(g),
           transportOf(g),
-          ["size", "/data", "--json"],
+          ["size", "/data", "--json", ...excludeFlags()],
         );
         const destRun = await runRclone(
           credentialsOf(g),
