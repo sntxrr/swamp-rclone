@@ -36,9 +36,19 @@ this suite is what protects it.**
 
 ## 2. Scope
 
-**In:** all of volume1 — 13.8 TB across 19 shares — copied to S3 Glacier Deep
-Archive, on a schedule, driven from the existing `swamp serve` instance on the
-`docker` host, with credentials from 1Password Connect.
+**In:** all of volume1 except `appliance-backups`, and excluding every share's
+recycle bin — **9.6 TB across 18 shares** — copied to S3 Glacier Deep Archive, on a schedule, driven from the existing
+`swamp serve` instance on the `docker` host, with credentials from 1Password
+Connect.
+
+That figure is **apparent** size, which is the only one that predicts a
+transfer: tar and rclone both read file contents, so sparse holes and
+reflink-shared extents are read and uploaded in full. Physical usage — what
+`df` reports, and the source of the 13.8 TB this document previously claimed —
+undercounts the work by however much the filesystem is sharing. On `vm-dumps`
+the gap is 2.6x (1.3 TB apparent against 0.5 TB allocated, sparse VM images);
+on `appliance-backups` it is 216x, which is why that share is now out of
+scope.
 
 **Also in:** metric emission, so the ladder is observable in the existing
 Prometheus/Grafana stack rather than only in `swamp data query` (§6).
@@ -46,13 +56,15 @@ Prometheus/Grafana stack rather than only in `swamp data query` (§6).
 **Out:**
 
 - Restoring the NAS. This suite proves a restore is *possible* and drills it on
-  a sample; a full 13.8 TB recovery is an operator runbook, not a model method.
+  a sample; a full 9.6 TB recovery is an operator runbook, not a model method.
 - Managing the AWS side — bucket creation, lifecycle rules, IAM. That is
   `@swamp/aws/s3` territory; this suite consumes a bucket it did not create.
 - Replacing restic. The two coexist: restic covers the Linux fleet to B2, this
   covers the NAS to Glacier.
-- **The initial seed.** Moving the first 13.8 TB is explicitly *not* a swamp
+- **The initial seed.** Moving the first 9.6 TB is explicitly *not* a swamp
   method (§5.1). swamp owns the steady state; the seed is an operator job.
+- **`appliance-backups`.** Removed from scope after measurement; see §2.1. It is
+  4.7 TB on disk but **1 015 TB to read**, and no bandwidth makes that finish.
 
 ### 2.1 Scope decision, recorded
 
@@ -65,14 +77,36 @@ appliance-backup store, a set of VM dumps, and a Time Machine target.
 Archiving them is backups-of-backups, and two consequences follow that the
 implementation must handle rather than hide:
 
-| Share | Size | Consequence |
-| ----- | ---: | ----------- |
-| `appliance-backups` | 4.1 T | A backup appliance's own deduplicated chunk store. Restorable only *through that appliance*, so an object-level copy is a copy of an opaque format. Churns as it prunes. |
-| `mac-backups` | 1.3 T | Time Machine sparsebundles — roughly 157 000 8 MB band files rewritten continuously. Every run replaces objects that Deep Archive **still bills for 180 days**. This is the single largest recurring cost risk in the suite. |
-| `vm-dumps` | 1.4 T | Dumps of hosts that already have their own restic repositories elsewhere. |
+| Share | On disk | To read | Consequence |
+| ----- | ------: | ------: | ----------- |
+| `appliance-backups` | 4.7 T | **1 015 T** | **Out of scope — see below.** A backup appliance's own deduplicated chunk store. Restorable only *through that appliance*, so an object-level copy is a copy of an opaque format. Churns as it prunes. |
+| `mac-backups` | 1.5 T | 1.5 T | Time Machine sparsebundles — roughly 157 000 8 MB band files rewritten continuously. Every run replaces objects that Deep Archive **still bills for 180 days**. This is the single largest recurring cost risk in the suite. |
+| `vm-dumps` | 0.5 T | 1.3 T | Dumps of hosts that already have their own restic repositories elsewhere. Sparse images: 2.6x more to read than to store. |
 
 `scan` therefore **must** measure and report churn per share (§4, rung 1), so
 the cost of this decision is visible in data rather than discovered on a bill.
+
+**The `appliance-backups` reversal, recorded.** Full-volume coverage was chosen
+before anyone had measured what the shares cost to *read* rather than to store,
+and one of them does not survive that measurement.
+
+Active-Backup-style appliances write each snapshot as a full-size image and let
+the filesystem share the unchanged extents — btrfs reflinks, not hardlinks.
+Individual images measure 1.86 TiB apparent against 860 GiB allocated with
+`links = 1`, across many dated snapshots. **Neither tar nor rclone can see
+through a reflink**: both open the file and read it, so every snapshot is read
+at full size and every byte the filesystem was sharing is uploaded again, once
+per snapshot. The share is 4.7 TB on disk and 1 015 TB to read — 216x.
+
+At the measured uplink (§5.1) that is on the order of millennia, so this is not
+a cost trade-off to weigh but an impossibility to route around. Nothing in the
+suite could have absorbed it either: the ratio is a property of the source
+filesystem, invisible to the destination.
+
+It is therefore **out of scope**, and protecting that appliance's data is
+delegated back to the appliance. The general lesson is the one now enforced in
+code: **size a transfer by apparent bytes, never by `df` or `du` defaults**, or
+dedup and sparseness will silently rewrite the estimate.
 
 ### 2.2 What the data actually looks like
 
@@ -83,37 +117,65 @@ and sizes is a complete contents inventory of the volume this suite exists to
 protect. The sizes and proportions are real, because the design decisions
 follow from them.
 
+Sizes are apparent and net of recycle bins, per §2 and §2.3. Rows are rounded
+independently, so they do not sum exactly.
+
 | Share | Size | Shape |
 | ----- | ---: | ----- |
-| `appliance-backups` | 4.1 T | opaque chunk store, churning |
 | `media-library` | 3.8 T | large media files — ideal Glacier shape |
 | `homes` | 2.7 T | **the irreplaceable data**; mixed sizes, many small |
-| `vm-dumps` | 1.4 T | large dump files |
+| `vm-dumps` | 1.3 T | sparse VM images — 0.5 T on disk |
 | `mac-backups` | 1.3 T | ~157 k churning 8 MB bands |
 | `video-originals` | 0.4 T | large video originals |
-| five small shares | 0.1 T | mixed |
-| **total** | **13.8 T** | |
+| thirteen small shares | 0.2 T | mixed |
+| **total** | **9.6 T** | |
+| ~~`appliance-backups`~~ | ~~1 015 T~~ | **out of scope (§2.1)** — 4.7 T on disk, 216x on read |
+| ~~recycle bins~~ | ~~0.7 T~~ | **never archived (§2.3)** — deleted files |
 
 Two distinct shapes, needing two strategies (§4). Large-file shares copy
 object-per-file efficiently. Small-file trees do not: Deep Archive bills 40 KB
 of overhead per object regardless of file size, so a share of 500 KB documents
 pays roughly 8% overhead before storing a byte, plus $0.05 per 1 000 PUTs.
 
+### 2.3 Recycle bins are never archived
+
+Every DSM share carries a `#recycle` directory: the files a human already chose
+to delete. None of it is archived, at any rung.
+
+The case is not really about money, though the money is real — 705 GiB, **7.3%
+of everything otherwise in scope**, and one share measured **97.6% recycle
+bin**. The case is that Deep Archive bills a 180-day minimum per object and a
+recycle bin *churns*: it fills as people delete things and empties when someone
+clears it, so each run archives freshly-deleted files and pays six months for
+each, in perpetuity, for data whose defining property is that nobody wants it.
+
+The exclusion is applied at **every** rung that counts or moves bytes — `scan`,
+`push`, `verify`, and both the sizing and the tar of the packing path. That
+consistency is load-bearing rather than tidy: exclude it from `push` but not
+from `verify`, and `verify` compares a filtered destination against an
+unfiltered source and reports a permanent, meaningless delta — which trains
+whoever reads it to ignore the rung that exists to catch real drift.
+
+The list is deliberately short, and holds only what is definitionally not worth
+archiving. `@eaDir` — DSM's regenerable thumbnail and index sidecars — is a
+defensible addition on the same logic and is **not** currently excluded; it is a
+separate decision, not an oversight.
+
 ## 3. Cost model
 
 Storage is not the constraint. **Recovery is.**
 
-| Item | Rate | 13.8 TB |
-| ---- | ---- | -------: |
-| Deep Archive storage | $0.00099 / GB-mo | **$13.65 / mo** |
+| Item | Rate | 9.6 TB |
+| ---- | ---- | -----: |
+| Deep Archive storage | $0.00099 / GB-mo | **$9.52 / mo** |
 | Per-object overhead | 40 KB / object | ~$2.50 / mo per million objects |
 | Upload (PUT) | $0.05 / 1 000 | one-off, per object |
-| Retrieval — bulk (48 h) | $0.0025 / GB | $34 |
-| Retrieval — standard (12 h) | $0.02 / GB | $276 |
-| **Egress to internet** | **$0.09 / GB** | **$1 241** |
+| Retrieval — bulk (48 h) | $0.0025 / GB | $24 |
+| Retrieval — standard (12 h) | $0.02 / GB | $192 |
+| **Egress to internet** | **$0.09 / GB** | **$865** |
 
 Egress dominates every other line by an order of magnitude. A full recovery of
-volume1 costs more in bandwidth than four years of storing it. This is worth
+the archive costs more in bandwidth than seven years of storing it. This is worth
 knowing *before* it is needed, which is why `scan` records the projected
 retrieval cost of every share it inventories.
 
@@ -172,10 +234,21 @@ package installed by hand does not survive a DSM upgrade. A container does.
 
 The first full copy is out of scope for swamp, for a reason that is structural
 rather than stylistic: **a swamp method has a 6-hour default timeout, and the
-seed cannot finish inside one.** At 100 Mbps of saturated upload, 13.8 TB takes
-roughly 13 days; even a gigabit symmetric link needs more than a day. There is
-no cadence at which a single `push` invocation completes it, and a push that ran
-for days would hold the per-model lock for days, blocking every other rung.
+seed cannot finish inside one.** There is no cadence at which a single `push`
+invocation completes it, and a push that ran for days would hold the per-model
+lock for days, blocking every other rung.
+
+**The link is the ceiling, and it is lower than assumed.** Measured from the NAS
+across four samples: 31.4 / 50.0 / 58.7 / 23.6 Mbit/s up. The best of those
+matches the 58 Mbit/s a real 37-file `push` achieved almost exactly, which
+settles a question worth settling once — **7.2 MB/s was the pipe being full, not
+a concurrency limit.** `--transfers`, `--s3-upload-concurrency` and
+`--s3-chunk-size` have no throughput to recover here, and an earlier note in
+this project claiming the ISP imposed no cap was simply wrong.
+
+So 9.6 TB takes **~15 days at the peak rate and ~22 days at the four-sample
+mean**, and the honest planning figure is the latter. Tune those flags for
+memory safety (§5.2) if at all; do not expect them to buy time.
 
 So the seed runs as an operator job under [`herdr`](https://herdr.dev), which
 already manages long-lived sessions on this fleet — a named persistent session
@@ -185,8 +258,8 @@ continued rather than restarted.
 
 **The seed must use the same flags the model would.** This is the one real
 hazard of stepping outside swamp: a hand-written command that omits
-`--s3-storage-class` lands 13.8 TB at S3 Standard rates — roughly $295/mo
-against $13 — and nothing in rclone's output says so. The seed command is
+`--s3-storage-class` lands 9.6 TB at S3 Standard rates — roughly $221/mo
+against $10 — and nothing in rclone's output says so. The seed command is
 therefore *generated* by `push --input dryRun=true`, which runs the real code
 path and prints the exact invocation, rather than transcribed from memory.
 
@@ -194,6 +267,40 @@ Ingress to S3 is free, so the seed costs only PUT requests and storage. Those
 scale with object count, which is the strongest argument for packing the
 small-file shares before the seed rather than after: roughly $250 in PUTs at
 5M objects, against under a cent packed.
+
+### 5.2 A packed share has a size ceiling, and it is not obvious
+
+`pack` builds each object by piping `tar` into `rclone rcat`, so **the object's
+size is unknown when the upload starts**. That matters more than it sounds like
+it should. rclone grows `--s3-chunk-size` automatically to stay inside S3's
+10 000-part limit — but only for a file whose size it knows. A stream keeps
+whatever chunk size it was given, so at the 5 MiB default **every pack was
+capped at 48 GiB**, and the failure arrived 48 GiB into the transfer rather than
+at plan time. `mac-backups` holds a single 912 GiB sparsebundle, nineteen times
+over that line.
+
+The fix is available for free, because `buildPackPlan` already knows how big
+each pack is: the chunk size is derived from it, holding back 20% of the part
+budget for tar's own headers and padding. Two constraints bound the result:
+
+- **Memory.** rclone holds `--s3-upload-concurrency` chunks in RAM per transfer.
+  The NAS has 8 GB with ~3 GB free and is already several GB into swap, so this
+  is a real limit. Concurrency is spent down to one in-flight chunk before a
+  pack is refused — on this link that costs nothing measurable (§5.1), and the
+  alternative is an OOM.
+- **S3's 5 TiB object limit**, past which the subtree must be split.
+
+A pack that clears neither is **refused before any bytes move**, which is the
+entire point: the alternative is discovering it at part 10 000.
+
+**Size packs by apparent bytes.** `du` defaults to allocated blocks while tar
+streams apparent ones, so sparse and reflink-shared files are undercounted —
+and those are exactly the shares that select `pack`. Measured in the rclone
+image, a directory holding one 100 MiB sparse file and one 10 MiB real file
+reports 10 240 KB allocated against a 115 345 920-byte tar: an **11x
+undercount**, which would pick a chunk size 11x too small. busybox `du` spells
+apparent size `-b` — GNU's `--apparent-size` is absent, the image being
+Alpine — and `du -skb` predicts that same tar to within 2 560 bytes.
 
 ## 6. Observability
 

@@ -62,6 +62,95 @@ export const ARCHIVE_STORAGE_CLASSES = [
   "DEEP_ARCHIVE",
 ];
 
+const MIB = 1024 * 1024;
+
+/**
+ * S3's hard ceiling on parts in one multipart upload, and rclone's
+ * `--s3-max-upload-parts` default. Not tunable upward — it is S3's limit.
+ */
+export const S3_MAX_UPLOAD_PARTS = 10_000;
+
+/** rclone's `--s3-chunk-size` default. */
+export const S3_DEFAULT_CHUNK_BYTES = 5 * MIB;
+
+/** S3's largest single object. */
+export const S3_MAX_OBJECT_BYTES = 5 * 1024 ** 4;
+
+/** rclone's `--s3-upload-concurrency` default. */
+export const S3_DEFAULT_UPLOAD_CONCURRENCY = 4;
+
+/**
+ * Parts we allow ourselves of the 10 000 available, when sizing a pack.
+ *
+ * The 20% held back is not caution for its own sake — it is tar's overhead.
+ * `pack` streams a tar whose size is not known in advance, so the chunk size
+ * has to be chosen from an ESTIMATE of the finished stream, and tar adds a
+ * 512-byte header per member plus padding to a 512-byte boundary. On a share
+ * of small files (which is precisely what selects `pack`) that is a few
+ * percent; at a 4 KB mean file size it approaches 20%. Underestimating is
+ * unrecoverable — the upload dies at part 10 000, terabytes in — so the
+ * headroom absorbs it rather than trying to predict it.
+ */
+export const PACK_PART_BUDGET = 8_000;
+
+/**
+ * Default ceiling on rclone's in-flight upload buffers for one pack, in bytes.
+ *
+ * rclone buffers `--s3-upload-concurrency` chunks of `--s3-chunk-size` in
+ * memory per transfer. The NAS this suite was built against has 8 GB with
+ * roughly 3 GB available and is already several GB into swap, so the buffers
+ * are a real constraint and not an accounting exercise: the default 4 x
+ * auto-scaled chunk size for a multi-terabyte file is enough to OOM it.
+ */
+export const DEFAULT_PACK_MEMORY_BUDGET_BYTES = 1024 * MIB;
+
+/**
+ * Directory names that are never archived, at any depth.
+ *
+ * `#recycle` is DSM's per-share recycle bin: the files a human already chose to
+ * delete. Archiving it means paying Deep Archive's 180-day minimum to keep
+ * deleted data, and it is not a rounding error — measured across this volume it
+ * is 705 GiB, 7.3% of everything in scope, and one share is **97.6% recycle
+ * bin**. Worse, it churns: a recycle bin fills and empties continuously, so
+ * every run replaces objects that are still being billed for six months.
+ *
+ * This list is deliberately narrow. It holds things that are definitionally not
+ * worth archiving, not things that merely look like junk — `@eaDir` (DSM's
+ * regenerable thumbnail and index sidecars) is a defensible addition but is a
+ * separate decision, and is NOT excluded here.
+ *
+ * Applied at EVERY rung that counts or moves bytes. That consistency is the
+ * whole point: exclude it from `push` but not from `verify`, and `verify`
+ * compares a filtered destination against an unfiltered source and reports a
+ * permanent, meaningless delta.
+ */
+export const NEVER_ARCHIVE = ["#recycle"];
+
+/**
+ * rclone filter flags for {@link NEVER_ARCHIVE}.
+ *
+ * Deliberately UNANCHORED — no leading slash — so it matches at any depth. That
+ * is the opposite of the choice `buildRestoreArgs` makes, and for the opposite
+ * reason: there, a loose filter would retrieve every same-named object in the
+ * share and bill for it; here, a nested recycle bin is exactly as unwanted as a
+ * top-level one. DSM only creates `#recycle` at a share root today, so this is
+ * defence rather than a known case.
+ */
+export function excludeFlags(): string[] {
+  return NEVER_ARCHIVE.flatMap((name) => ["--exclude", `${name}/**`]);
+}
+
+/**
+ * The same exclusions as a fragment of tar's command line.
+ *
+ * Only the VALUE is quoted. Quoting the flag too is harmless to sh but makes
+ * the generated command — which an operator copies by hand to run the seed
+ * (SETUP.md §7.3) — read like a mistake.
+ */
+export function tarExcludeArgs(): string {
+  return NEVER_ARCHIVE.map((name) => `--exclude ${shQuote(name)}`).join(" ");
+}
+
 /** Subcommands that remove data. This suite never deletes. */
 const FORBIDDEN = new Set([
   "sync",
@@ -612,6 +701,9 @@ export function buildPackPlan(
 ): Pack[] {
   const packs: Pack[] = entries
     .filter((e) => e.name !== ".")
+    // A recycle bin is a top-level entry, so without this it becomes its own
+    // pack — an object whose entire contents are files someone deleted.
+    .filter((e) => !NEVER_ARCHIVE.includes(e.name))
     .map((e) => ({ name: e.name, member: e.name, bytes: e.bytes }))
     // Sort for deterministic ordering — a plan that varies run to run is a
     // plan that cannot be compared against the previous run.
@@ -621,6 +713,87 @@ export function buildPackPlan(
     packs.push({ name: "_root", member: ".", bytes: looseFileBytes });
   }
   return packs;
+}
+
+/** How one pack must be uploaded, or why it cannot be. */
+export type PackUploadPlan =
+  | {
+    streamable: true;
+    /** `--s3-chunk-size`, in bytes. */
+    chunkBytes: number;
+    /** `--s3-upload-concurrency`. */
+    uploadConcurrency: number;
+    /** Peak in-flight buffer this costs on the NAS. */
+    memoryBytes: number;
+  }
+  | { streamable: false; reason: string };
+
+/**
+ * Choose `--s3-chunk-size` and `--s3-upload-concurrency` for one streamed pack.
+ *
+ * This exists because a streamed upload has a SIZE CEILING that nothing in the
+ * rclone invocation announces. Quoting `rclone help backend s3` verbatim:
+ *
+ *   Rclone will automatically increase the chunk size when uploading a large
+ *   file of known size to stay below the 10,000 chunks limit. Files of unknown
+ *   size are uploaded with the configured chunk_size. Since the default chunk
+ *   size is 5 MiB and there can be at most 10,000 chunks, this means that by
+ *   default the maximum size of a file you can stream upload is 48 GiB.
+ *
+ * A pack is a tar on stdin, so its size is unknown and the auto-scaling never
+ * applies: every pack was capped at 48 GiB. That is not a theoretical limit
+ * here — a single Time Machine sparsebundle on the NAS this was built against
+ * is 912 GiB, nineteen times over, and it would have failed roughly 48 GiB into
+ * the upload rather than at plan time. `buildPackPlan` already knows each pack's size, so the chunk size
+ * can simply be derived from it.
+ *
+ * Concurrency is reduced before the pack is refused, because buffers are the
+ * only thing being traded away: a lower concurrency is slower, whereas an
+ * oversized chunk count is fatal. On this hardware the link is the bottleneck
+ * long before upload concurrency is (measured: ~58 Mbit/s peak), so dropping
+ * to a single in-flight chunk costs almost nothing real.
+ */
+export function planPackUpload(
+  bytes: number,
+  memoryBudgetBytes: number = DEFAULT_PACK_MEMORY_BUDGET_BYTES,
+  maxConcurrency: number = S3_DEFAULT_UPLOAD_CONCURRENCY,
+): PackUploadPlan {
+  if (bytes > S3_MAX_OBJECT_BYTES) {
+    return {
+      streamable: false,
+      reason:
+        `pack is ${(bytes / 1024 ** 4).toFixed(2)} TiB, above S3's 5 TiB ` +
+        `single-object limit; the subtree must be split`,
+    };
+  }
+
+  // Round up to whole MiB so the flag reads like something a human chose, and
+  // never go below rclone's own default.
+  const required = Math.ceil(bytes / PACK_PART_BUDGET);
+  const chunkBytes = Math.max(
+    S3_DEFAULT_CHUNK_BYTES,
+    Math.ceil(required / MIB) * MIB,
+  );
+
+  for (let c = maxConcurrency; c >= 1; c--) {
+    if (chunkBytes * c <= memoryBudgetBytes) {
+      return {
+        streamable: true,
+        chunkBytes,
+        uploadConcurrency: c,
+        memoryBytes: chunkBytes * c,
+      };
+    }
+  }
+
+  return {
+    streamable: false,
+    reason:
+      `pack needs a ${Math.round(chunkBytes / MIB)} MiB chunk size to stay ` +
+      `under ${S3_MAX_UPLOAD_PARTS} parts, and even one in-flight chunk ` +
+      `exceeds the ${Math.round(memoryBudgetBytes / MIB)} MiB memory budget; ` +
+      `raise packMemoryBudgetBytes only if the NAS genuinely has the RAM`,
+  };
 }
 
 /**
@@ -640,12 +813,15 @@ export function buildPackScript(
   member: string,
   destination: string,
   storageClass: string,
+  upload: Extract<PackUploadPlan, { streamable: true }>,
 ): string {
   return [
     "set -e",
     "set -o pipefail",
-    `tar -C /data -cf - ${shQuote(member)} | rclone rcat ` +
-    `${shQuote(destination)} --s3-storage-class ${shQuote(storageClass)}`,
+    `tar -C /data ${tarExcludeArgs()} -cf - ${shQuote(member)} | rclone rcat ` +
+    `${shQuote(destination)} --s3-storage-class ${shQuote(storageClass)} ` +
+    `--s3-chunk-size ${shQuote(String(upload.chunkBytes))} ` +
+    `--s3-upload-concurrency ${shQuote(String(upload.uploadConcurrency))}`,
   ].join("\n");
 }
 
@@ -848,7 +1024,12 @@ const GlobalArgsSchema = z.object({
   ),
   bucket: z.string().describe("Destination S3 bucket."),
   region: z.string().describe("Bucket region, e.g. us-west-2."),
-  accessKeyId: z.string().describe(
+  // Marked sensitive alongside the secret. An access key ID is an identifier
+  // rather than a credential, but it names the AWS account it belongs to, and
+  // there is no rung here that benefits from seeing it in a log or a resource
+  // snapshot. Redaction costs nothing; the alternative is a value that leaks
+  // by default and has to be noticed later.
+  accessKeyId: z.string().meta({ sensitive: true }).describe(
     "AWS access key ID. Needs only s3:PutObject, s3:GetObject, " +
       "s3:ListBucket and s3:RestoreObject — never s3:DeleteObject.",
   ),
@@ -915,6 +1096,20 @@ const GlobalArgsSchema = z.object({
   ),
   timeoutMinutes: z.number().optional().describe(
     "Per-invocation timeout. Default 360 — a multi-terabyte copy is slow.",
+  ),
+  packMemoryBudgetBytes: z.number().optional().describe(
+    "Pack strategy only. Ceiling on rclone's in-flight upload buffers for one " +
+      "pack. Default 1 GiB. A streamed pack needs a chunk size of at least " +
+      "packBytes/8000 to stay under S3's 10 000-part limit, and rclone holds " +
+      "--s3-upload-concurrency chunks of that size in RAM. Raise this only if " +
+      "the NAS actually has the memory: the one this was built against has " +
+      "8 GB with ~3 GB free and is already swapping.",
+  ),
+  s3UploadConcurrency: z.number().optional().describe(
+    "Pack strategy only. Maximum chunks in flight per pack (rclone default " +
+      "4). Reduced automatically when the memory budget cannot fund it. There " +
+      "is little throughput to lose: the uplink measured ~58 Mbit/s peak, so " +
+      "the link saturates long before upload concurrency matters.",
   ),
 });
 
@@ -1177,14 +1372,26 @@ async function pushPacked(
   // One tree walk for every top-level entry's size, plus the loose files at
   // the share root. `du -sk` is used rather than N× `rclone size` because the
   // latter would walk the whole share once per subdirectory.
+  //
+  // `-b` is what makes the number mean the right thing. It is busybox du's
+  // apparent-size flag (GNU spells it --apparent-size, which the rclone image
+  // does not have — the image is Alpine, so this du is busybox). Without it du
+  // reports ALLOCATED blocks, and tar streams APPARENT bytes, so every sparse
+  // or reflink-shared file is undercounted. That is not an edge case on this
+  // fleet: measured in the rclone container, a directory holding one 100 MiB
+  // sparse file and one 10 MiB real file reports 10 240 KB allocated against a
+  // 115 345 920-byte tar — an 11x undercount. Sizing a pack from the small
+  // number picks too small a chunk size, and the upload then dies at part
+  // 10 000 having transferred terabytes. Apparent size predicts the same tar
+  // to within 2 560 bytes.
   const duRun = await runRclone(
     NO_CREDENTIALS,
     destination,
     { ...transport, entrypoint: "sh" },
     [
       "-c",
-      "set -e\ndu -sk /data/* 2>/dev/null || true\n" +
-      'echo "$(find /data -maxdepth 1 -type f -exec du -k {} + 2>/dev/null | ' +
+      "set -e\ndu -skb /data/* 2>/dev/null || true\n" +
+      'echo "$(find /data -maxdepth 1 -type f -exec du -kb {} + 2>/dev/null | ' +
       "awk '{s+=$1} END {print s+0}')\t/data/.\"",
     ],
   );
@@ -1226,12 +1433,33 @@ async function pushPacked(
 
   let uploaded = 0;
   let skipped = 0;
+  let unstreamable = 0;
   const failed: string[] = [];
   let lastCode: number = RCLONE_EXIT.OK;
   let lastDetail = "";
 
   for (const pack of plan) {
     const object = `${dest}/${pack.name}.tar`;
+
+    // Decide streamability BEFORE the existence check and before any upload.
+    // The whole point of the ceiling guard is that the alternative is finding
+    // out at part 10 000, having already paid to transfer terabytes into a
+    // multipart upload that can never be completed.
+    const upload = planPackUpload(
+      pack.bytes,
+      g.packMemoryBudgetBytes ?? DEFAULT_PACK_MEMORY_BUDGET_BYTES,
+      g.s3UploadConcurrency ?? S3_DEFAULT_UPLOAD_CONCURRENCY,
+    );
+    if (!upload.streamable) {
+      failed.push(pack.name);
+      unstreamable++;
+      lastCode = RCLONE_EXIT.FATAL;
+      lastDetail = upload.reason;
+      context.logger.warn(
+        `${share}: pack ${pack.name} cannot be streamed — ${upload.reason}`,
+      );
+      continue;
+    }
 
     if (!repack) {
       const exists = await runRclone(creds, destination, transport, [
@@ -1248,7 +1476,10 @@ async function pushPacked(
     if (dryRun) {
       context.logger.info(
         `${share}: would pack ${pack.member} -> ${pack.name}.tar ` +
-          `(${(pack.bytes / 1e9).toFixed(2)} GB)`,
+          `(${(pack.bytes / 1e9).toFixed(2)} GB, ` +
+          `${Math.round(upload.chunkBytes / (1024 * 1024))} MiB chunks x ` +
+          `${upload.uploadConcurrency} = ` +
+          `${Math.round(upload.memoryBytes / (1024 * 1024))} MiB in flight)`,
       );
       uploaded++;
       continue;
@@ -1258,7 +1489,7 @@ async function pushPacked(
       creds,
       destination,
       { ...transport, entrypoint: "sh" },
-      ["-c", buildPackScript(pack.member, object, storageClass)],
+      ["-c", buildPackScript(pack.member, object, storageClass, upload)],
     );
 
     if (run.code === RCLONE_EXIT.OK) {
@@ -1282,7 +1513,13 @@ async function pushPacked(
     passed,
     inconclusive: false,
     nothingToTransfer: uploaded === 0 && skipped > 0,
-    failureReason: passed ? null : "pack-failed",
+    // "pack-too-large" is kept distinct from "pack-failed" because the two
+    // need opposite responses: a failed pack is worth retrying, an oversized
+    // one will fail identically forever until the subtree is split or the
+    // memory budget is genuinely raised.
+    failureReason: passed
+      ? null
+      : (unstreamable === failed.length ? "pack-too-large" : "pack-failed"),
     detail: passed ? null : lastDetail || null,
     exitCode: passed ? RCLONE_EXIT.OK : lastCode,
     storageClass,
@@ -1303,7 +1540,7 @@ async function pushPacked(
 
 export const model = {
   type: "@sntxrr/rclone/archive",
-  version: "2026.08.15.1",
+  version: "2026.08.16.1",
   globalArguments: GlobalArgsSchema,
 
   resources: {
@@ -1476,7 +1713,7 @@ export const model = {
           NO_CREDENTIALS,
           destinationOf(g),
           transportOf(g),
-          ["size", "/data", "--json"],
+          ["size", "/data", "--json", ...excludeFlags()],
         );
 
         const parsed = run.code === RCLONE_EXIT.OK
@@ -1641,7 +1878,7 @@ export const model = {
           credentialsOf(g),
           destinationOf(g),
           transportOf(g),
-          ["copy", "/data", dest, ...flags],
+          ["copy", "/data", dest, ...flags, ...excludeFlags()],
         );
 
         const nothing = run.code === RCLONE_EXIT.NO_TRANSFER;
@@ -1706,7 +1943,7 @@ export const model = {
           NO_CREDENTIALS,
           destinationOf(g),
           transportOf(g),
-          ["size", "/data", "--json"],
+          ["size", "/data", "--json", ...excludeFlags()],
         );
         const destRun = await runRclone(
           credentialsOf(g),
@@ -1963,7 +2200,17 @@ export const model = {
             credentialsOf(g),
             destinationOf(g),
             transportOf(g),
-            ["sha256sum", object],
+            // `hashsum sha256`, NOT `sha256sum`. rclone has dedicated `md5sum`
+            // and `sha1sum` commands and no `sha256sum`, so the symmetrical
+            // spelling exits 2 with `unknown command` — which is how this was
+            // found, on the first live retrieval this suite ever completed.
+            //
+            // `--download` is what makes the rung mean anything. Without it
+            // rclone asks the REMOTE for the hash, and S3 does not serve
+            // SHA-256, so nothing would be downloaded and nothing proved: the
+            // drill exists to show the bytes come back, not to read metadata
+            // about bytes that never moved.
+            ["hashsum", "sha256", object, "--download"],
           );
 
         const pending = /InvalidObjectState|not restored|storage class/i.test(

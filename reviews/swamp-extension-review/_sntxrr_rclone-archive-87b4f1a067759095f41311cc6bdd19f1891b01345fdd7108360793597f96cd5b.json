@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/rclone-archive",
+  "version": "2026.08.16.1",
+  "reviewedAt": "2026-08-16T16:45:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "accessKeyId is NOW .meta({ sensitive: true }), reversing the reasoning in the previous review. That review argued the key ID is an identifier and consciously left it unmarked to match the sibling extensions; on re-examination the argument is thin, because the ID names the AWS account it belongs to and no rung here benefits from seeing it in a log or a resource snapshot. Redaction costs nothing, so the linter rule is now satisfied rather than argued with. Defence remains layered: runRclone refuses to spawn if either credential appears in argv on EITHER host (ps is world-readable on both); credentials travel as a docker --env-file streamed down the SSH stdin pipe into a FIFO in a private 0700 dir, so they reach neither argv nor the NAS filesystem; stderr is redacted at the subprocess boundary because rclone echoes remote config into error text; and a credential containing a newline is rejected rather than silently truncated."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Each rung's real output is the resource it writes; logs carry what an operator needs to act. Pack planning now logs the derived chunk size, the concurrency and the resulting in-flight buffer on a dry run, so the memory cost of a pack is visible before it is paid, and a pack refused for size logs the reason rather than failing silently. Failure detail is captured on the resource (truncated, redacted) rather than only in a log line that may not be retained."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "rclone's exit codes are encoded and classified rather than collapsed to pass/fail, and inconclusive (5 temporary, 8 transfer-limit, 10 duration-limit, plus timeout) is kept distinct from failure so a capped or retried run is not recorded as a broken archive. --error-on-no-transfer makes code 9 a distinct outcome instead of an ambiguous 0. New: pack-too-large is a distinct failureReason from pack-failed, because the two need opposite responses -- a failed pack is worth retrying, an oversized one fails identically forever until the subtree is split or the memory budget genuinely rises. Verified live: docker's 125 classified as exit-125 and reported as an unreachable share rather than throwing."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "110 tests, confirmed by exit status; the writeResource stub parses against the REAL spec schemas; a fake ssh drives the true subprocess boundary; two tests execute the generated remote shell for real. THE GAP THAT KEPT THIS AT ISSUE IS CLOSED: restoreDrill completed against real Deep Archive on 2026-08-16, returning 34 180 bytes with sha256 equal to the source hash and contentMatched true. All five rungs are now proven against real hardware. The retrieval took ~17 h against the 12 h AWS advertises, which is worth knowing before planning a recovery. Four live bugs have now been found that a fully green suite could not see -- DSM refusing to open /dev/stdin, GLACIER_DEEP_ARCHIVE not being a storage class, restore pointing at a file instead of a directory, and rclone having no sha256sum command. The fourth is the sharpest lesson: tests covered the packed drill, the pending case and the mismatch case, but none asserted what argv the UNPACKED path emits, so a command that cannot exist survived every run. A test now asserts that argv. The suite is strong but its limits are demonstrated rather than assumed."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "copy, never sync: nine destructive subcommands refused at the runner, each asserted. --immutable by default. --no-traverse coupled to --max-age in code so the cost trap cannot be split. restoreRequest is idempotent by design -- 409 RestoreAlreadyInProgress is recognised as success. Restore filters are anchored and glob-escaped. New: the #recycle exclusion is applied at every rung that counts or moves bytes -- scan, push, verify, and both the sizing and the tar of the packing path -- while the DESTINATION side of verify is deliberately left unfiltered. That asymmetry is the point: filtering both sides would hide anything already uploaded, and filtering only push would make verify compare a filtered destination against an unfiltered source and report a permanent meaningless delta, which trains an operator to ignore the one rung that catches real drift."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Exit codes and billing rules are encoded from observed behaviour, not docs. Storage classes are validated against the set S3 accepts before being judged on cost, after a live 400 InvalidStorageClass. `backend restore` is known NOT to signal per-object outcomes through its exit code -- a per-object error exits 0 with the failure only in the JSON Status, and a filter matching nothing also exits 0; both are parsed and both treated as failures. Two more contract facts are now encoded from the binary rather than assumed. rclone has dedicated md5sum and sha1sum commands and NO sha256sum, so the symmetrical spelling exits 2; hashing is `hashsum sha256 --download`, and the --download half is load-bearing because without it rclone requests the hash from the remote, S3 does not serve SHA-256, and the drill would report success over bytes that never moved. And rclone only auto-scales --s3-chunk-size for files whose size it KNOWS, so a tar streamed into rcat keeps the configured chunk and is capped at 10 000 parts. ETags remain unused, since a multipart ETag is not a content MD5."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "The remote temp dir is removed by a trap on EXIT INT TERM; the FIFO writer is killed rather than waited on, because if docker dies before opening the FIFO the writer is still blocked in open() and a wait would hang until the six-hour timeout. Both paths asserted, the no-hang case executed. Subprocesses run under an AbortController with a six-hour default. Incomplete multipart uploads are handled by a bucket lifecycle rule; a live run left zero. New: rclone buffers upload-concurrency chunks of chunk-size in RAM per transfer, and a multi-terabyte pack needs a large chunk, so a pack now carries an explicit memory budget defaulting to 1 GiB. It is not bookkeeping -- the NAS has 8 GB with ~3 GB free and is already several GB into swap. Concurrency is spent down to a single in-flight chunk before a pack is refused, which on this link costs nothing measurable because the uplink saturates at ~58 Mbit/s long before concurrency matters."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "The shipped surface is rclone_archive.ts, README.md, LICENSE.md and manifest.yaml; the test file is NOT shipped. Re-audited per-file against every real identifier seen in live output this session, with a control match to prove the scanner was actually matching -- a first attempt returned a false clean because the file list collapsed into one argument, which is the same silent zero-match failure this suite guards against elsewhere. ONE GENUINE LEAK WAS FOUND AND FIXED: a comment named a real share and a real backup filename together, and the same string had reached a commit message. Both were rewritten while the branch was still unpushed, so nothing escaped. The previous review's claim that no share names appear was therefore too strong, and is corrected here. THREE REAL IDENTIFIERS REMAIN, each pre-existing and deliberate: one real share name used as a path-with-a-space test fixture, which CONVENTIONS explicitly requires be a path that actually exists; the destination prefix nas/volume1 used as the documented example, which is also the production value; and glacier-archive, the real IAM user and 1Password item name, appearing in vault-reference examples. None is a credential, none reveals the bucket, account or contents, and full history was swept for credentials with only the joke placeholder hunter2 in a doc example showing the wrong way to pass a secret. Flagged rather than hidden so the owner can overrule."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "zod v4 throughout, for global arguments and all four resource specs. A test asserts every spec has a schema and that methods write only declared specs, and because the test context parses through the real schema, a drifting resource shape fails the suite rather than reaching the datastore. Two new optional global arguments, packMemoryBudgetBytes and s3UploadConcurrency, are described in terms of the constraint they exist to express rather than as bare knobs. The model's self-reported version and the manifest version were out of step by a day and are now synchronised; nothing enforces that they agree, so it is worth re-checking at each publish."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "All four specs are lifetime infinite with garbageCollection 50. Infinite is deliberate for an archive of last resort: the inventory, transfer, verification and retrieval records ARE the audit trail, and the churn calculation reads the previous scan, so expiring history would silently disable cost and churn detection."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "na",
+      "note": "Deliberately not a CRUD model. This is a cost-ordered verification ladder over a destination it must never mutate destructively; there is no create/update/delete surface by design, and the runner refuses the nine rclone subcommands that remove data. The bucket and IAM key are consumed, not created -- the blast radius stops at 'uploads to the wrong prefix'."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Three checks. source-path-absolute exists because a relative path does not fail -- docker silently creates a named volume and the archive would be of nothing. credentials-present catches an unresolved vault reference. archive-storage-class asks validity then cost in that order, because reporting an invalid class as 'not an archive tier' sends you looking at cost instead of spelling. The absence of a restore-acknowledgement check is deliberate and documented in place: checks receive only globalArgs, so it would reject --input allowRestore=true before execute ran. Packing now performs its own plan-time refusal, which is preflight in spirit: a pack too large to stream, or too large to buffer, is rejected before any bytes move rather than at part 10 000, terabytes in."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Each spec writes a distinct instance name derived from shareName, and a test asserts the names are distinct across specs so one rung cannot overwrite another's record."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Churn wiring is documented to use data.latest(<model>, <RESOURCE INSTANCE>), with an explicit warning that the second argument is the share name and not the spec name -- passing the spec name fails at expression resolution, which is a confusing failure worth pre-empting in the schema description."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "na",
+      "note": "First publish; no previously published version exists, so no upgrade entries apply. The registry confirmed no version drift to check against."
+    }
+  ]
+}

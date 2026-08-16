@@ -49,10 +49,12 @@ is no Entware on this box, and a hand-installed binary does not survive a DSM
 upgrade. A container does.
 
 **It reports the recovery cost, not just the storage cost.** Storage is cheap
-enough to be invisible — $13.65/mo for 13.8 TB. Egress for a full recovery is
-**$1 241**. An archive whose recovery cost is first discovered *during* a
-recovery is an archive nobody can afford to use, so `scan` records that number
-every time it runs.
+enough to be invisible — $9.52/mo for the 9.6 TB in scope (the volume holds
+13.8 TB; one share and every recycle bin are excluded — see
+[`PRD.md`](./PRD.md) §2.1 and §2.3, and the reasons are worth reading). Egress
+for a full recovery is **$865**. An archive whose recovery cost is first
+discovered *during* a recovery is an archive nobody can afford to use, so `scan`
+records that number every time it runs.
 
 See [`PRD.md`](./PRD.md) for scope and [`CONVENTIONS.md`](./CONVENTIONS.md) for
 the implementation contract and every rclone and Deep Archive trap it guards
@@ -114,11 +116,16 @@ Complete: `scan`, `push` (direct **and** pack), `verify`, `restoreRequest` and
 `restoreDrill` (including single-member extraction from a pack, which is what
 proves the packing is reversible).
 
-72 tests, and all 14 guards mutation-verified.
+109 tests, and all 14 guards mutation-verified.
 
-**Not yet done:** live verification against the NAS. Nothing here has run
-against real hardware, so treat every rclone and DSM behaviour it relies on as
-asserted rather than observed.
+**Live against real hardware.** Rungs 1-4 have run against the NAS, and doing so
+found three bugs a fully green suite could not see — a storage class that was
+wrong but allowlisted, a credential transport DSM refuses to open, and a
+backgrounded writer that silently supplied no credentials at all. `restoreDrill`
+is the one rung still awaiting its first live retrieval.
+
+**Recycle bins are never archived** (`PRD.md` §2.3), and one share is out of
+scope entirely because deduplicated snapshots expand 216x on read (§2.1).
 
 **Planned, not built:** metric emission to Prometheus, so a rung that has not
 run becomes an alert rather than something you have to remember to query —
