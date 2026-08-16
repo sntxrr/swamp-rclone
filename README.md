@@ -50,7 +50,7 @@ upgrade. A container does.
 
 **It reports the recovery cost, not just the storage cost.** Storage is cheap
 enough to be invisible — $9.52/mo for the 9.6 TB in scope (the volume holds
-13.8 TB; one share and every recycle bin are excluded — see
+13.8 TB; one share, every recycle bin and every `@eaDir` are excluded — see
 [`PRD.md`](./PRD.md) §2.1 and §2.3, and the reasons are worth reading). Egress
 for a full recovery is **$865**. An archive whose recovery cost is first
 discovered *during* a recovery is an archive nobody can afford to use, so `scan`
@@ -124,8 +124,9 @@ wrong but allowlisted, a credential transport DSM refuses to open, and a
 backgrounded writer that silently supplied no credentials at all. `restoreDrill`
 is the one rung still awaiting its first live retrieval.
 
-**Recycle bins are never archived** (`PRD.md` §2.3), and one share is out of
-scope entirely because deduplicated snapshots expand 216x on read (§2.1).
+**Recycle bins and `@eaDir` are never archived** (`PRD.md` §2.3) — deleted data
+and regenerable thumbnails respectively — and one share is out of scope entirely
+because deduplicated snapshots expand 216x on read (§2.1).
 
 **Planned, not built:** metric emission to Prometheus, so a rung that has not
 run becomes an alert rather than something you have to remember to query —
