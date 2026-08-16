@@ -49,8 +49,9 @@ is no Entware on this box, and a hand-installed binary does not survive a DSM
 upgrade. A container does.
 
 **It reports the recovery cost, not just the storage cost.** Storage is cheap
-enough to be invisible — $13.65/mo for 13.8 TB. Egress for a full recovery is
-**$1 241**. An archive whose recovery cost is first discovered *during* a
+enough to be invisible — $10.27/mo for the 10.4 TB in scope (the volume holds
+13.8 TB; one share is excluded — see [`PRD.md`](./PRD.md) §2.1, and the reason
+is worth reading). Egress for a full recovery is **$933**. An archive whose recovery cost is first discovered *during* a
 recovery is an archive nobody can afford to use, so `scan` records that number
 every time it runs.
 

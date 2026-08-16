@@ -171,7 +171,7 @@ makes the drill slow enough to be easy to postpone forever.
 ## 7. Seeding out of band, under herdr
 
 The first full copy does not run as a swamp method (PRD §5.1) — no cadence gets
-13.8 TB through a 6-hour timeout. It runs as a long-lived operator session under
+10.4 TB through a 6-hour timeout. It runs as a long-lived operator session under
 [`herdr`](https://herdr.dev), which manages persistent sessions on this fleet.
 
 > **Unverified.** herdr is installed under the `sntxrr` profile on the NAS but
@@ -248,8 +248,8 @@ herdr session list                              # what is running
 ```
 
 Copy the command from step 1 rather than writing one. A hand-written invocation
-that omits `--s3-storage-class` puts 13.8 TB at S3 Standard rates — about
-$295/mo against $13 — and rclone will not mention it.
+that omits `--s3-storage-class` puts 10.4 TB at S3 Standard rates — about
+$239/mo against $10 — and rclone will not mention it.
 
 ### 7.4 Handing over to swamp
 
