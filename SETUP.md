@@ -166,6 +166,26 @@ swamp model method run archive-<share> restoreDrill \
   --input objectPath=<key> --input sourceSha256=<sha>
 ```
 
+**Run step 1 before step 3, and not only for the cost estimate.** With
+`strategy` left at its default `auto`, `push` measures the share and picks
+`direct` or `pack` from the mean file size. `scan` reports the same decision, so
+step 1 is where you see it before any bytes move — and if the two ever disagree,
+that is a bug, not a tuning choice.
+
+Until 2026.08.19.3, `push` did not implement `auto` at all: it fell through to
+`direct` regardless, while `scan` correctly reported `pack`. Packing exists only
+to amortise the 40 KB per-object billing minimum, so on a small-file share the
+effect was to pay that minimum per file, with both rungs reporting success. If
+you have objects archived before that version, they were written object-per-file
+whatever `scan` said. They are not wrong, only more expensive — and note that
+this suite cannot remove them: `--immutable`, no `sync`, and the IAM user has no
+`s3:DeleteObject`. Re-pushing such a share as a pack stores it twice for the
+180-day minimum, so it is worth doing only where the overhead justifies it.
+
+Pinning `strategy` explicitly skips the measurement, which is a full source
+walk. That is worth doing on a scheduled incremental run, where the answer is
+already known and will not change.
+
 Do not skip step 5 on the grounds that steps 1–4 passed. Everything below it
 compares metadata, and metadata cannot see corruption — an archive that has
 never been restored is an assumption, not a backup. That is the entire lesson

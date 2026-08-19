@@ -1254,7 +1254,10 @@ const GlobalArgsSchema = z.object({
     "Pinned rclone image. Default rclone/rclone:1.75.0. Never use :latest.",
   ),
   strategy: z.enum(["auto", "direct", "pack"]).optional().describe(
-    "Upload strategy. auto (default) picks from mean file size at scan time.",
+    "Upload strategy. auto (default) measures the source and picks from mean " +
+      "file size. Pinning direct or pack skips that measurement, which is a " +
+      "full source walk -- worth doing on a scheduled incremental run where the " +
+      "answer is known and stable.",
   ),
   packThresholdBytes: z.number().optional().describe(
     "Mean file size below which auto chooses pack. Default 1 MiB.",
@@ -1749,7 +1752,7 @@ async function pushPacked(
 
 export const model = {
   type: "@sntxrr/rclone/archive",
-  version: "2026.08.19.2",
+  version: "2026.08.19.3",
   globalArguments: GlobalArgsSchema,
 
   // No-op: this release changes what gets EXCLUDED and how a pack is sized and
@@ -1777,6 +1780,15 @@ export const model = {
         "The seed emission also prints the env file the command reads from " +
         "stdin, with the secrets as placeholders. Without it the pasted " +
         "command blocks in cat rather than running. No globalArguments changes.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.19.3",
+      description:
+        "push resolves the documented `auto` strategy by measuring, instead " +
+        "of falling through to direct and paying the 40 KB per-object " +
+        "minimum on every small file. No globalArguments changes -- `auto` " +
+        "was already the documented default; it simply was not implemented.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -2063,10 +2075,98 @@ export const model = {
         const g = context.globalArgs;
         const share = g.shareName;
         const dryRun = args.dryRun ?? false;
-        const strategy = args.strategy ??
-          (g.strategy && g.strategy !== "auto" ? g.strategy : "direct");
         const dest = destPath(g.bucket, g.destPrefix ?? "", share);
         const storageClass = g.storageClass ?? DEFAULT_STORAGE_CLASS;
+
+        // `auto` is the documented default and it MUST be resolved here, by
+        // measuring, rather than fallen through to "direct".
+        //
+        // It used to fall through, and that was the worst possible shape for
+        // the bug. scan computes the same decision correctly and reports
+        // strategy=pack, so the operator is told the share will be packed and
+        // then push silently does the opposite, both rungs reporting success.
+        // Packing exists solely to amortise the 40 KB per-object billing
+        // minimum, so on a small-file share the effect is to pay that minimum
+        // per file -- the exact silent overspend this suite is built to catch,
+        // and it made the pack path unreachable in production, which is why
+        // three releases of pack fixes were all found by measurement and never
+        // by a live run.
+        //
+        // The measurement is `rclone size` on the SOURCE only: no credentials,
+        // no S3 request, nothing billed. It is a full source walk, so pinning
+        // `strategy` explicitly is worth doing on a scheduled incremental run
+        // where the answer is already known and will not change -- and doing so
+        // skips this entirely.
+        const pinned = args.strategy ??
+          (g.strategy && g.strategy !== "auto" ? g.strategy : undefined);
+
+        let strategy: "direct" | "pack";
+        if (pinned) {
+          strategy = pinned;
+        } else {
+          const sizeRun = await runRclone(
+            NO_CREDENTIALS,
+            destinationOf(g),
+            transportOf(g),
+            ["size", "/data", "--json", ...excludeFlags()],
+          );
+          const measured = sizeRun.code === RCLONE_EXIT.OK
+            ? parseSize(sizeRun.stdout)
+            : null;
+
+          if (measured === null) {
+            // Refuse rather than assume. Defaulting to direct here would be
+            // the original bug wearing a comment, and defaulting to pack would
+            // tar a share whose size we just failed to establish.
+            const reason = sizeRun.code === RCLONE_EXIT.OK
+              ? "unparseable-size-output"
+              : classifyFailure(sizeRun);
+            context.logger.warn(
+              `${share}: cannot measure the share, so the auto strategy is ` +
+                `undetermined (${reason}). Pin \`strategy\` to push anyway.`,
+            );
+            const handle = await context.writeResource(
+              "transfer",
+              `${share}-transfer`,
+              {
+                shareName: share,
+                destination: dest,
+                strategy: "direct",
+                dryRun: args.dryRun ?? false,
+                passed: false,
+                inconclusive: true,
+                nothingToTransfer: false,
+                failureReason: `strategy-undetermined: ${reason}`,
+                detail: sizeRun.stderr.slice(0, 2000) || null,
+                exitCode: sizeRun.code,
+                storageClass,
+                packsPlanned: 0,
+                packsUploaded: 0,
+                packsSkipped: 0,
+                packsFailed: 0,
+                failedPacks: [],
+                ranAt: new Date().toISOString(),
+                durationMs: Date.now() - started,
+              },
+            );
+            return { dataHandles: [handle] };
+          }
+
+          strategy = chooseStrategy(
+            measured.count,
+            measured.bytes,
+            g.packThresholdBytes ?? 1024 * 1024,
+          );
+          const mean = measured.count > 0
+            ? Math.round(measured.bytes / measured.count)
+            : 0;
+          context.logger.info(
+            `${share}: auto strategy = ${strategy} (${measured.count} files, ` +
+              `mean ${mean} B against a ${
+                g.packThresholdBytes ?? 1024 * 1024
+              } B threshold)`,
+          );
+        }
 
         if (strategy === "pack") {
           return await pushPacked(args, context, started);
