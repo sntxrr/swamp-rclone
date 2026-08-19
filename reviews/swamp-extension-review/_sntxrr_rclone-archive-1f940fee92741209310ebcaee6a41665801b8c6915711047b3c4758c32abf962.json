@@ -1,0 +1,87 @@
+{
+  "extension": "@sntxrr/rclone-archive",
+  "version": "2026.08.19.5",
+  "reviewedAt": "2026-08-19T20:45:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "No credential surface is touched. The change is confined to buildPackScript's tar half; the rclone rcat half -- storage class, --s3-no-check-bucket, chunk size, concurrency -- is byte-identical, verified by rendering both scripts. `find` receives no argument derived from an argument or a secret: the path is the literal /data mount and the expression is a constant. Everything from .4 stands: credentials travel as a docker --env-file streamed into a 0600 FIFO, reach neither argv nor the NAS filesystem, the argv check REFUSES rather than redacts, and the shell-entrypoint guard still requires --s3-no-check-bucket or --s3-storage-class on every credentialed invocation."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Unchanged, and adequate for the new failure mode. A pack that cannot be built now fails the pipeline under pipefail and is recorded in failedPacks with the member name, which is what an operator needs to find it. The bug being fixed was not a logging gap -- it was two rungs disagreeing while BOTH logged success -- so the durable remedy is the construction-level agreement below, not another log line. No new log could have caught the old bug, because nothing in the system knew the tar was wrong."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "The one new failure mode is a tar fed an empty list: busybox exits 1 with `tar: empty archive`, and set -o pipefail turns that into a failed pack rather than a zero-byte object. Probed directly in the pinned image against a directory holding only a subdirectory. This is reachable only if a loose file vanishes between the du rung and the push rung, since buildPackPlan emits _root only when looseFileBytes > 0 -- and failing loudly on that race is the correct direction, where the OLD glob would have matched the surviving directories, uploaded a tar of bare directory entries, and recorded success. The fix therefore improves the race, not just the common path."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "134 tests, confirmed by exit status, up from 131. Three are new and one is the load-bearing one: 'the _root pack selects the same set buildDuScript measures' asserts the SAME find expression appears in both buildPackScript and buildDuScript. That is deliberately a test of the agreement rather than of either side, because the bug was not in either function -- each was internally reasonable -- it was in their relationship, which no single-function test can see. A second test asserts `./*` is ABSENT rather than asserting the find expression is present, so a future edit that reintroduces a glob fails even if it keeps the find. The third pins the busybox constraint (-T -, no --null, no -print0) so the newline-separated list is not 'tidied' into -print0 by someone assuming GNU tar. Beyond the unit tests the fix was verified against the real share in the pinned production image: .DS_Store present, @eaDir and docker/ absent."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Object NAMES remain a function of the share layout, never of the data, so the property that matters on Deep Archive -- that an unchanged subtree is not re-uploaded into a fresh 180-day minimum -- is untouched. One residual, stated rather than left implicit: `find` emits directory order, so the member ORDER inside _root.tar is not deterministic across runs. It has no cost or correctness consequence here, because existing packs are skipped rather than compared, restoreDrill extracts a member BY NAME, and a repack replaces the object wholesale -- but a future change that starts hashing pack bytes to detect drift would break on it, and should sort the list at that point rather than wonder why. A second, quieter improvement: -T - streams the member list, so a share root with very many loose files can no longer overflow argv the way `./*` word-expansion could."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "No signature, argument, or resource-schema change. buildPackScript keeps its four parameters and returns a script string; the transfer resource keeps every field. Callers are unaffected, which is why the upgrade entry is an identity function."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Nothing is staged on the NAS: find writes to a pipe, tar streams to stdout, rcat streams to S3, exactly as before. Peak memory is still the chunk-size times concurrency figure planPackUpload computes, unchanged. If anything the footprint is marginally smaller -- the shell no longer materialises a glob expansion of every top-level entry before exec."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "manifest.yaml and the model's version field agree at 2026.08.19.5. README.md and PRD.md were corrected in the same commit rather than left describing the removed --no-recursion glob -- which matters more than usual here, because the PRD passage was the document that made the glob approach sound deliberate and settled. deno fmt and deno check are clean on both TypeScript files; LICENSE.md and README.md were not reformatted."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "No schema change. Worth recording that `strategy` remains a strict z.enum(['auto','direct','pack']).optional() -- confirmed while auditing the instance that claimed to pin `direct` in a comment but never set the key. The enum is what makes such a pin verifiable once written; the failure there was a missing key in an instance, not a loose schema."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "Untouched. transfer stays lifetime infinite with garbageCollection 50."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "na",
+      "note": "Still not a CRUD model. It deliberately cannot delete -- --immutable, no sync, no s3:DeleteObject -- which is the very constraint that makes this bug class expensive: the already-published empty _root.tar cannot be corrected in place, only superseded."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "The shell-entrypoint guard is unchanged and still refuses a credentialed script naming neither --s3-no-check-bucket nor --s3-storage-class; the rendered _root script satisfies it. The stronger preflight added here is not a runtime check at all but a compile-time one -- the sizing rung and the tar rung now share a literal expression, so they cannot drift apart again without a test failing."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Unchanged; each spec still writes a distinct instance name, covered by an existing test."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Unchanged. push still cannot read a prior resource -- the ExecuteContext API does not allow it -- which is why the pack is measured in-run rather than read from the last scan, and why the two rungs had to be made to agree by sharing an expression rather than by sharing a value."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "An upgrades entry for 2026.08.19.5 is present with an identity upgradeAttributes, which is required even though globalArguments are unchanged -- without one an existing instance keeps its old typeVersion forever and never picks the new tar up. That is not academic for this release: an instance left on .4 keeps building _root from the glob and keeps dropping dotfiles silently, so the upgrade entry is the mechanism that actually delivers the fix."
+    },
+    {
+      "id": "behaviour-narrowing",
+      "verdict": "issue",
+      "note": "SELF-REPORTED RESIDUAL, zero impact today but recorded rather than passed silently. `find -type f` does not match symlinks, whereas the old `./*` glob did -- so a loose SYMLINK in a share root was previously archived into _root.tar as a symlink entry and now is not. Verified across all 18 in-scope share roots on the real NAS: there are zero loose symlinks, and the check was proved live with a positive control (a fixture symlink is listed by -type l and excluded by -type f), because an empty result from a broken find is indistinguishable from an empty result from a clean volume. Not a regression against the invariant: buildDuScript has ALWAYS sized loose files with -type f, so symlinks were never counted in looseFileBytes, and a share root containing only symlinks produced looseFileBytes = 0 and therefore no _root pack at all under the old code too -- the symlinks were dropped there as well, just by a different route. The narrowing is real only in the mixed case (a loose file AND a loose symlink), where the old code archived the symlink incidentally. Widening to \\( -type f -o -type l \\) would reintroduce exactly the rung disagreement this release exists to remove, since du still would not count them, so it must not be done on its own -- both rungs would have to change together. Flagged here so the next person meets a documented decision instead of rediscovering it as a second silent omission."
+    }
+  ]
+}
