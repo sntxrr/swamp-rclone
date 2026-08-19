@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/rclone-archive",
+  "version": "2026.08.19.4",
+  "reviewedAt": "2026-08-19T20:10:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "Unchanged in substance and re-verified. The argv credential check still REFUSES rather than redacts; credentials still travel as a docker --env-file streamed into a 0600 FIFO, reaching neither argv nor the NAS filesystem; stderr is redacted at the subprocess boundary. The new flag carries no secret. One thing was checked specifically because this release was driven by an AWS error message: the 403 names the IAM user ARN including the ACCOUNT ID, and that string appears in no shipped file, no doc and no commit message -- grepped the whole worktree and the commit body. It does land in the persisted transfer resource's `detail` field when a run fails that way, which is the same runtime-disclosure trade already recorded for the emitted seed command."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "The failure this release fixes was diagnosed entirely from what the suite already records: the transfer resource's detail field carried rclone's full 403 including the denied action, which was enough to identify the cause without reproducing anything. That is the design working. Note also that the method-level CLI status reported success while the transfer resource recorded packsFailed -- correct, since the resource is the result, but worth knowing before treating a green method run as a green transfer."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "The new failure is moved from runtime to plan time where it can be: a shell-entrypoint script missing either required flag now throws before anything is spawned, rather than failing partway through a tar stream that may already have moved terabytes. The per-object failure path is unchanged and was observed working -- packsFailed, failureReason pack-failed, exit 1, detail retained."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "131 tests, up from 128. Four new: the guard refuses a script missing --s3-no-check-bucket, an ordinary argv invocation gets it injected, and the pack script names it inside the script rather than appended. THE FIX WAS VERIFIED AGAINST THE LIVE BUCKET BEFORE BEING WRITTEN, not after: the identical rcat without the flag returns 403 and writes nothing, with the flag the object lands in DEEP_ARCHIVE. That ordering matters here, because the previous two releases were each written against a hypothesis and the hypothesis was right; this one could have been wrong and was cheap to settle for one 6-byte object. One existing test had to change: the storage-class guard test matched on the error's PROSE, so it broke when the message changed to cover both flags. It now matches the flag name. A test that asserts wording rather than behaviour is a test that breaks for the wrong reasons, and this one did."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Unchanged. copy never sync, destructive subcommands refused, --immutable by default, --no-traverse coupled to --max-age, restore filters anchored. --s3-no-check-bucket removes a request, never adds a write, and cannot make an operation destructive. Re-running a failed packed push is safe: nothing was written, so there is no partial object to collide with, and the abort-incomplete-multipart lifecycle rule sweeps anything left mid-flight."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "A new rclone/S3 contract is encoded from observed behaviour rather than documentation: rclone verifies the destination bucket and attempts CreateBucket when that check is inconclusive, and rcat takes that path per object while copy does not. That asymmetry is why the direct strategy ran green against real hardware for days while the packed path failed on its first object. Recorded in SETUP \u00a72 under the IAM policy, where someone hitting the 403 will actually look, and explicitly warning against granting s3:CreateBucket to clear the error."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Unchanged, and marginally improved: skipping the bucket check removes one S3 request per invocation. Trap-based temp dir cleanup, the FIFO writer killed rather than waited on, the six-hour AbortController and the pack memory budget all stand."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Re-audited per-file across the four shipped files with a control match first. Scanned for host, domain, bucket, LAN range, seventeen real share names AND the AWS account id surfaced by this release's error message -- zero hits in any shipped file, and zero across the whole worktree including SETUP.md and the commit body. The three pre-existing accepted identifiers are unchanged; this release adds none."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "zod v4 throughout, no schema changed, the test context still parses through the real resource schemas. Model version and manifest version checked against each other: both 2026.08.19.4."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "Unchanged. All four specs lifetime infinite, garbageCollection 50, deliberate for an archive of last resort."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "na",
+      "note": "Still deliberately not a CRUD model. This release removes a bucket-creation attempt, which narrows the surface rather than widening it."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Effectively strengthened. The shell-entrypoint guard is a preflight in all but name, and it now covers both flags that fail expensively and non-obviously -- one silently at 23x the price, the other loudly but only after the transfer has begun."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Untouched; the distinctness test passes. Object names are unaffected by this release."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Untouched. Churn wiring still uses data.latest(<model>, <RESOURCE INSTANCE>), and the ExecuteContext still cannot read prior resources, which is why push measures for itself."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "Handled. Upgrades entries now cover 2026.08.19.1 through .4, each returning globalArguments unchanged -- no field was added, renamed, removed or retyped in any of them. Retained no-op entries are harmless because entries are filtered by toVersion > typeVersion, and removing one would bet that no instance anywhere recorded that typeVersion. Verified live this session across eighteen instances."
+    }
+  ]
+}
