@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/rclone-archive",
+  "version": "2026.08.19.2",
+  "reviewedAt": "2026-08-19T19:10:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "The release's whole subject is printing a command, so this dimension carries the weight of it. Nothing regressed and one defence got stronger. runRclone's assembly moved into buildRcloneInvocation unchanged, including the check that REFUSES to build a command when either credential appears in argv on either host -- that refusal is what makes the printed string safe by construction rather than by redaction, and there is deliberately no scrubbing pass that could be got wrong. Credentials still travel as a docker --env-file streamed down the SSH stdin pipe into a 0600 FIFO in a private dir, so they reach neither argv nor the NAS filesystem, and the printed command contains only the literal \"$ENVF\" expansion. The env-file TEMPLATE added in .2 is built by handing buildEnvFile placeholder credentials, so the real values are never in that string either; two tests assert both halves. accessKeyId remains .meta({ sensitive: true }). Residual, accepted and stated rather than hidden: the printed command does contain the bucket, destination prefix, SSH host and source mount path, and dryRun run logs are persisted, so those non-secret identifiers now appear in stored logs where before they did not. Verified in a real log file rather than assumed."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "dryRun previously logged what it WOULD pack and nothing else, which made SETUP \u00a77.3 step 1 -- 'copy the generated command rather than writing one' -- an instruction with nothing behind it. Confirmed by reading every logger call on the old code before changing anything: the assembled remote string was never logged at any level. Both strategies now log it through the same function the real run uses. The pack path logs one command per pack, matching how it actually runs (one tar stream per top-level entry, one container each), so the operator is not handed a single command for work that is a list. .2 adds the env file to that output after running the .1 emission for real showed the command alone blocks in cat -- a log line that produces a hang is worse than no log line, and that is now covered by a test that pins the stdin preamble as the REASON the template must be printed."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Unchanged and still correct: rclone exit codes are classified rather than collapsed, inconclusive (5, 8, 10, timeout) stays distinct from failure, --error-on-no-transfer keeps 9 meaningful, and pack-too-large is a distinct failureReason from pack-failed because the two want opposite responses. The new code adds no failure path -- logSeedCommand cannot fail independently, since buildRcloneInvocation throws on exactly the conditions that would have stopped the real run a moment later. That is deliberate: an emission that swallowed a refusal would print a command the code would not run."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "124 tests, confirmed by exit status, up from 117. Seven are new and they pin the properties that make the seed safe rather than merely exercising the new lines: the emitted command names the storage class; it contains neither credential; a credential in argv throws; stripping --dry-run leaves the real command otherwise byte-identical (asserted as an exact string equality, not a substring, so any other divergence fails); the packed form still inlines the class inside the script where an appended flag would become a shell positional; the env template carries placeholders and neither real value; and the command really does contain the stdin/FIFO preamble. The last is the one worth calling out -- it exists so that a future refactor removing the FIFO surfaces here instead of leaving the SETUP recipe quietly wrong. Honest limit: nothing tests the emitted command by EXECUTING it against S3, so 'this string transfers bytes correctly' rests on it being the same string the tested run path uses, which is why sharing the builder was the design rather than a convenience."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Untouched. copy never sync, nine destructive subcommands refused at the runner, --immutable by default, --no-traverse coupled to --max-age in code, restoreRequest idempotent with 409 treated as success, restore filters anchored and glob-escaped, #recycle and @eaDir excluded at every rung that counts or moves bytes while the destination side of verify stays unfiltered on purpose. Emission is pure and side-effect-free, so a dryRun remains a dryRun."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "The encoded rclone and S3 contracts are unchanged. One CONTRACT OF A DIFFERENT KIND was found wrong and fixed: every documented invocation in SETUP.md and the extension README had the swamp CLI as `model <type> method run <method> <name>`, but it is `model method run <model> <method>`, so all of them failed with `Model not found: scan`. The \u00a77.3 seed command was among them, which means step 1 did not run as written either -- the docs described a workflow nobody could have executed end to end. Corrected in both files. Verified by running scan, push --input dryRun=true and the emission against real hardware today."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Untouched. The remote temp dir is removed by a trap on EXIT INT TERM, the FIFO writer is killed rather than waited on so a docker failure before open() cannot hang until the six-hour timeout, subprocesses run under an AbortController, incomplete multiparts are swept by a bucket lifecycle rule, and the pack memory budget still refuses rather than OOMs a NAS with ~3 GB free. Emission allocates one string per pack and holds nothing."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Re-audited per-file against the four shipped files (rclone_archive.ts, README.md, LICENSE.md, manifest.yaml -- the test file is present in the directory but NOT shipped), with a control match first. The control earned its keep: the initial scan collapsed the file list into a single argument and returned a false clean, the same silent zero-match failure this suite guards against elsewhere, and only the control revealed it. Scanned for every internal identifier seen in live output this session -- host, domain, bucket, LAN range, and eleven real share names -- with zero hits. THE THREE PRE-EXISTING ACCEPTED IDENTIFIERS REMAIN AND ARE UNCHANGED: one real share name required by CONVENTIONS to be a path that actually exists, the destPrefix example which is also the production value, and glacier-archive as the IAM user and 1Password item name in vault examples. The owner has explicitly approved leaving these; this release adds none. New consideration recorded rather than treated as surface: the emitted command carries the bucket name and SSH host at RUNTIME and lands in persisted run logs. That is not published surface, but it is a change in what a shared log discloses, and it is the first thing here that puts the bucket name in a file by default."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "zod v4 throughout for global arguments and all four resource specs; the test context parses through the real schemas so a drifting resource shape fails the suite rather than reaching the datastore. No schema changed this release -- the emission reads existing global arguments and writes no new field. The model's self-reported version and the manifest version were checked against each other and both read 2026.08.19.2; nothing enforces that they agree, so this stays a per-publish check rather than a solved problem."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "Unchanged. All four specs are lifetime infinite with garbageCollection 50, deliberate for an archive of last resort: the inventory, transfer, verification and retrieval records ARE the audit trail, and the churn calculation reads the previous scan, so expiring history would silently disable cost and churn detection."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "na",
+      "note": "Still deliberately not a CRUD model. A cost-ordered verification ladder over a destination it must never mutate destructively; no create/update/delete surface by design, and the runner refuses the nine rclone subcommands that remove data. The bucket and IAM key are consumed, not created. This release adds a read-only output and does not change that."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "The three checks are untouched and still correct, and all three passed on the live instance today (8/8 validations including source-path-absolute, credentials-present and archive-storage-class). No new precondition is introduced: the emission runs after the same guards the real transfer runs after, so it cannot advertise a command the guards would have rejected."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Untouched, distinctness test still passes, and object names are unaffected -- this release writes no objects and renames none. Worth recording for the operator rather than the code: only ONE instance exists today, and the seed this feature is for needs one per share."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Untouched. Churn wiring still uses data.latest(<model>, <RESOURCE INSTANCE>). No new resource is written; the seed command is emitted to the log, deliberately not persisted as a resource, because it embeds the transport of the moment (image digest, mount path, ssh host) and a stored copy would be a stale command that still looks authoritative -- exactly the drift the shared builder exists to prevent."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "Handled. 2026.08.16.2 is published, so this release adds upgrades entries for both 2026.08.19.1 and 2026.08.19.2, each returning globalArguments unchanged because no field was added, renamed, removed or retyped. The .1 entry is kept even though .1 was never published: upgrades are filtered by toVersion > typeVersion, so a retained no-op entry is harmless, whereas removing it would be a bet that no instance anywhere ever recorded that typeVersion. Verified live today that the mechanism works rather than assuming it: the one existing instance was still pinned to the pre-fix 2026.08.15.1 and moved itself to 2026.08.16.2 on its first run."
+    }
+  ]
+}
