@@ -464,8 +464,34 @@ function logSeedCommand(
   args: string[],
 ): void {
   const { remote } = buildRcloneInvocation(creds, dest, transport, args);
+
+  // The command READS THE CREDENTIALS FROM ITS OWN STDIN. That is not incidental
+  // -- the whole `exec 3<&0 ... mkfifo ... cat <&3 > "$ENVF"` preamble exists
+  // because `docker run -e` leaks into `ps` on the NAS and DSM refuses to open
+  // /dev/stdin. Pasted on its own into a shell, it therefore does not fail: it
+  // BLOCKS in `cat` reading the terminal, looking like a hung transfer.
+  //
+  // So the command alone is not a runnable seed, and printing it alone would
+  // hand the operator a trap. The env file is printed with it, with the two
+  // secret values replaced by placeholders -- built by passing placeholder
+  // credentials to the real buildEnvFile, so the true values are never in the
+  // string at all rather than being substituted back out of it.
+  const template = buildEnvFile(
+    {
+      accessKeyId: "<ACCESS_KEY_ID>",
+      secretAccessKey: "<SECRET_ACCESS_KEY>",
+    },
+    dest,
+  );
+
   context.logger.info(
-    `${label}: run this on the NAS, inside a herdr session (SETUP §7.3):\n${remote}`,
+    `${label}: run this on the NAS, inside a herdr session (SETUP §7.3).\n` +
+      `Feed the env file to it on STDIN -- it will hang waiting for it ` +
+      `otherwise. Substitute the two placeholders from the vault, and prefer a ` +
+      `process substitution over a file so the secrets never land on the NAS ` +
+      `disk:\n\n` +
+      `--- env file (stdin) ---\n${template}` +
+      `--- command ---\n${remote}`,
   );
 }
 
@@ -1723,7 +1749,7 @@ async function pushPacked(
 
 export const model = {
   type: "@sntxrr/rclone/archive",
-  version: "2026.08.19.1",
+  version: "2026.08.19.2",
   globalArguments: GlobalArgsSchema,
 
   // No-op: this release changes what gets EXCLUDED and how a pack is sized and
@@ -1743,6 +1769,14 @@ export const model = {
       description:
         "dryRun now prints the exact command the seed is pasted from, " +
         "instead of only what it would pack. No globalArguments changes.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.19.2",
+      description:
+        "The seed emission also prints the env file the command reads from " +
+        "stdin, with the secrets as placeholders. Without it the pasted " +
+        "command blocks in cat rather than running. No globalArguments changes.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

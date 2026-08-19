@@ -344,6 +344,39 @@ appear in it. They reach the container through the env-file streamed into a
 FIFO, which shows up only as `"$ENVF"`, and `buildRcloneInvocation` *refuses*
 to build a command whose argv contains a credential rather than redacting one.
 
+**The command reads its credentials from its own stdin, and will hang if you
+forget.** That is not a quirk to work around — it is the credential transport:
+`docker run -e` leaks into `ps` on the NAS, and DSM cannot open `/dev/stdin`
+(see CONVENTIONS §6), so the wrapper makes a FIFO and pipes an env file into
+it. Pasted on its own the command does not fail with a clear error; it **blocks
+in `cat` reading the terminal**, which reads as a hung transfer.
+
+So step 1 prints the env file with the command, with the two secret values as
+`<ACCESS_KEY_ID>` and `<SECRET_ACCESS_KEY>`. Supply them in the pane like this,
+which keeps them out of scrollback:
+
+```bash
+# In the herdr pane on the NAS. -s suppresses the echo.
+read -rs -p 'aws access key id: '     AKID; echo
+read -rs -p 'aws secret access key: ' SK;   echo
+
+printf 'RCLONE_CONFIG_DEST_TYPE=s3\n...\nRCLONE_CONFIG_DEST_ACCESS_KEY_ID=%s\nRCLONE_CONFIG_DEST_SECRET_ACCESS_KEY=%s\n' \
+  "$AKID" "$SK" | <paste the command here>
+
+unset AKID SK
+```
+
+Fill the `...` from the printed env file — the non-secret lines (type, provider,
+region, location constraint, storage class) are printed verbatim and must be
+passed through unchanged. **`RCLONE_CONFIG_DEST_STORAGE_CLASS` is one of them**,
+so dropping a line here loses the storage class just as surely as dropping the
+flag would, and just as silently.
+
+The values stay in the pane's shell environment until `unset`, so they are
+readable via `/proc/<pid>/environ` by that user for the life of the seed. That
+is a deliberate trade against writing them to the NAS disk, where they would
+outlive the transfer.
+
 ### 7.4 Handing over to swamp
 
 Once the seed is complete, swamp takes the steady state. The handover is a

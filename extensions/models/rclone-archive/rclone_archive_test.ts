@@ -1792,3 +1792,47 @@ Deno.test("a packed seed command inlines the class, since the flag would hit the
     )
   );
 });
+
+Deno.test("the seed env template carries placeholders, never the real values", () => {
+  // Built by handing buildEnvFile placeholder credentials, so the true values
+  // are never in the string rather than being substituted back out of it --
+  // there is no redaction step here that could be got wrong.
+  const template = buildEnvFile(
+    { accessKeyId: "<ACCESS_KEY_ID>", secretAccessKey: "<SECRET_ACCESS_KEY>" },
+    SEED_DEST,
+  );
+  assert(!template.includes(SEED_CREDS.accessKeyId));
+  assert(!template.includes(SEED_CREDS.secretAccessKey));
+  assertStringIncludes(
+    template,
+    "RCLONE_CONFIG_DEST_ACCESS_KEY_ID=<ACCESS_KEY_ID>",
+  );
+  assertStringIncludes(
+    template,
+    "RCLONE_CONFIG_DEST_SECRET_ACCESS_KEY=<SECRET_ACCESS_KEY>",
+  );
+  // The non-secret half must be real, or the operator cannot use it.
+  assertStringIncludes(
+    template,
+    "RCLONE_CONFIG_DEST_STORAGE_CLASS=DEEP_ARCHIVE",
+  );
+  assertStringIncludes(
+    template,
+    `RCLONE_CONFIG_DEST_REGION=${SEED_DEST.region}`,
+  );
+});
+
+Deno.test("the emitted command really does read its credentials from stdin", () => {
+  // This is why the env file has to be emitted with it: pasted alone the
+  // command blocks in `cat` reading the terminal, which reads as a hung
+  // transfer rather than as a missing argument.
+  const { remote } = buildRcloneInvocation(
+    SEED_CREDS,
+    SEED_DEST,
+    SEED_TRANSPORT,
+    ["copy", "/data", "dest:example-bucket/x"],
+  );
+  assertStringIncludes(remote, "exec 3<&0");
+  assertStringIncludes(remote, "mkfifo");
+  assertStringIncludes(remote, "--env-file");
+});
