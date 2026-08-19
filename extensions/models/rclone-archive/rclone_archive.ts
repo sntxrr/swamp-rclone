@@ -339,25 +339,29 @@ export function buildEnvFile(
 }
 
 /**
- * Run rclone on the remote host, in a container, over SSH.
+ * Assemble the exact remote command line, and the secret list used to redact
+ * its output. Enforces the three invariants documented on `runRclone`.
  *
- * Three invariants are enforced here rather than trusted to callers, because
- * each fails invisibly and expensively:
+ * Split out of `runRclone` so that `--input dryRun=true` can PRINT the command
+ * the seed will be run by hand (SETUP §7.3) while printing the very same string
+ * the code would execute. That identity is the entire point: the seed is a
+ * multi-day transfer started by pasting a command into a shell, and a
+ * separately-constructed "here is what we would run" could drift from what
+ * actually runs. Drift here is not cosmetic -- lose `--s3-storage-class` and
+ * the whole volume lands at S3 Standard, about 23x the Deep Archive price,
+ * with rclone reporting complete success.
  *
- *  - Destructive subcommands are refused. `sync` against a source that failed
- *    to mount empties the destination, unrecoverably and still billed.
- *  - Secrets never reach argv on EITHER host. They travel as an env-file
- *    streamed down the SSH stdin pipe and into a FIFO on the remote, so they
- *    also never land on the NAS filesystem. See buildRemoteCommand.
- *  - The storage class is injected. Without it the upload silently lands at S3
- *    Standard rates and nothing says so until the bill.
+ * Safe to log, and that is guaranteed rather than assumed: the credential-in-
+ * argv check below REFUSES rather than redacts, so a returned command string
+ * cannot contain a secret. Credentials travel in the env-file streamed into
+ * the FIFO, which appears here only as the literal "$ENVF" expansion.
  */
-export async function runRclone(
+export function buildRcloneInvocation(
   creds: RcloneCredentials,
   dest: RcloneDestination,
   transport: RcloneTransport,
   args: string[],
-): Promise<RcloneResult> {
+): { remote: string; secrets: string[] } {
   const subcommand = args.find((a) => !a.startsWith("-"));
   if (subcommand && FORBIDDEN.has(subcommand)) {
     throw new Error(
@@ -433,6 +437,64 @@ export async function runRclone(
     ...argv,
   ]);
 
+  return { remote, secrets };
+}
+
+/**
+ * Under `dryRun`, print the command the operator will paste to run this
+ * transfer by hand.
+ *
+ * SETUP §7.3 tells the operator to copy this rather than write one, because a
+ * hand-written invocation that drops `--s3-storage-class` archives at S3
+ * Standard and rclone reports success. That instruction was unbacked until
+ * now: dryRun logged what it WOULD pack and nothing else, so there was no
+ * command to copy and the only way to seed was to write one.
+ *
+ * The argv passed here must be the argv of the REAL run, not the dry one --
+ * `--dry-run` is stripped by the caller. Emitting the dry command would be
+ * worse than emitting nothing: it looks copy-pasteable, runs cleanly, and
+ * transfers not one byte.
+ */
+function logSeedCommand(
+  context: { logger: { info: (m: string) => void } },
+  label: string,
+  creds: RcloneCredentials,
+  dest: RcloneDestination,
+  transport: RcloneTransport,
+  args: string[],
+): void {
+  const { remote } = buildRcloneInvocation(creds, dest, transport, args);
+  context.logger.info(
+    `${label}: run this on the NAS, inside a herdr session (SETUP §7.3):\n${remote}`,
+  );
+}
+
+/**
+ * Run rclone on the remote host, in a container, over SSH.
+ *
+ * Three invariants are enforced here rather than trusted to callers, because
+ * each fails invisibly and expensively:
+ *
+ *  - Destructive subcommands are refused. `sync` against a source that failed
+ *    to mount empties the destination, unrecoverably and still billed.
+ *  - Secrets never reach argv on EITHER host. They travel as an env-file
+ *    streamed down the SSH stdin pipe and into a FIFO on the remote, so they
+ *    also never land on the NAS filesystem. See buildRemoteCommand.
+ *  - The storage class is injected. Without it the upload silently lands at S3
+ *    Standard rates and nothing says so until the bill.
+ */
+export async function runRclone(
+  creds: RcloneCredentials,
+  dest: RcloneDestination,
+  transport: RcloneTransport,
+  args: string[],
+): Promise<RcloneResult> {
+  const { remote, secrets } = buildRcloneInvocation(
+    creds,
+    dest,
+    transport,
+    args,
+  );
   const controller = new AbortController();
   const timeoutMs = transport.timeoutMs ?? 6 * 60 * 60 * 1000;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -1591,6 +1653,17 @@ async function pushPacked(
           `${upload.uploadConcurrency} = ` +
           `${Math.round(upload.memoryBytes / (1024 * 1024))} MiB in flight)`,
       );
+      // One command per pack, because that is how the pack path really runs:
+      // one tar stream per top-level entry, each its own container. A seed of a
+      // packed share is therefore a list of commands, not a single one.
+      logSeedCommand(
+        context,
+        `${share}/${pack.name}`,
+        creds,
+        destination,
+        { ...transport, entrypoint: "sh" },
+        ["-c", buildPackScript(pack.member, object, storageClass, upload)],
+      );
       uploaded++;
       continue;
     }
@@ -1650,7 +1723,7 @@ async function pushPacked(
 
 export const model = {
   type: "@sntxrr/rclone/archive",
-  version: "2026.08.16.2",
+  version: "2026.08.19.1",
   globalArguments: GlobalArgsSchema,
 
   // No-op: this release changes what gets EXCLUDED and how a pack is sized and
@@ -1663,6 +1736,13 @@ export const model = {
       description:
         "Exclude @eaDir; size packs net of excluded subtrees; stop the _root " +
         "pack tarring the whole share. No globalArguments changes.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.19.1",
+      description:
+        "dryRun now prints the exact command the seed is pasted from, " +
+        "instead of only what it would pack. No globalArguments changes.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1998,11 +2078,27 @@ export const model = {
 
         // `copy`, never `sync`. The runner refuses `sync` outright; naming it
         // here as well makes the intent legible at the call site.
+        const rcloneArgs = ["copy", "/data", dest, ...flags, ...excludeFlags()];
+
+        // Strip ONLY --dry-run, and by filtering the real argv rather than by
+        // rebuilding it. Any other divergence between what is printed and what
+        // runs would reintroduce exactly the drift this exists to remove.
+        if (dryRun) {
+          logSeedCommand(
+            context,
+            share,
+            credentialsOf(g),
+            destinationOf(g),
+            transportOf(g),
+            rcloneArgs.filter((a) => a !== "--dry-run"),
+          );
+        }
+
         const run = await runRclone(
           credentialsOf(g),
           destinationOf(g),
           transportOf(g),
-          ["copy", "/data", dest, ...flags, ...excludeFlags()],
+          rcloneArgs,
         );
 
         const nothing = run.code === RCLONE_EXIT.NO_TRANSFER;

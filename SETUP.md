@@ -141,24 +141,28 @@ first — every method in the suite goes through this one path.
 
 ## 6. First run, in order (after the seed — see §7)
 
+The CLI is `swamp model method run <model> <method>` — model first, then
+method. Earlier revisions of this file had it the other way round, which fails
+with `Model not found: scan`.
+
 ```bash
 # 1. What is there, and what would recovery cost?
-swamp model @sntxrr/rclone-archive method run scan archive-<share>
+swamp model method run archive-<share> scan
 
 # 2. Dry run. Nothing is billed, nothing is written.
-swamp model @sntxrr/rclone-archive method run push archive-<share> --input dryRun=true
+swamp model method run archive-<share> push --input dryRun=true
 
 # 3. A capped real run against ONE small share before anything large.
-swamp model @sntxrr/rclone-archive method run push archive-<share> \
+swamp model method run archive-<share> push \
   --input maxTransferBytes=1073741824
 
 # 4. Inventory comparison
-swamp model @sntxrr/rclone-archive method run verify archive-<share>
+swamp model method run archive-<share> verify
 
 # 5. Prove it comes back. Bulk tier is 48 hours; run restoreDrill the next day.
-swamp model @sntxrr/rclone-archive method run restoreRequest archive-<share> \
+swamp model method run archive-<share> restoreRequest \
   --input objectPath=<key> --input allowRestore=true
-swamp model @sntxrr/rclone-archive method run restoreDrill archive-<share> \
+swamp model method run archive-<share> restoreDrill \
   --input objectPath=<key> --input sourceSha256=<sha>
 ```
 
@@ -299,8 +303,8 @@ whatever environment the seed depends on.
 
 ```bash
 # 1. Generate the exact command — real code path, nothing uploaded.
-swamp model @sntxrr/rclone-archive method run push archive-<share> \
-  --input dryRun=true
+#    Note the argument order: the CLI is `method run <model> <method>`.
+swamp model method run archive-<share> push --input dryRun=true
 
 # 2. Attach a named session on the NAS from your workstation.
 herdr --remote <nas> --session glacier-seed
@@ -316,6 +320,29 @@ herdr session list                              # what is running
 Copy the command from step 1 rather than writing one. A hand-written invocation
 that omits `--s3-storage-class` puts 9.6 TB at S3 Standard rates — about
 $221/mo against $10 — and rclone will not mention it.
+
+**This became true in 2026.08.19.1, and was not before.** Until then `dryRun`
+logged only what it *would* pack; the assembled command was never printed at
+any level, so step 1 produced nothing to paste and the only way to seed was to
+write the invocation by hand — the exact thing the paragraph above forbids. It
+now logs the command through the same `buildRcloneInvocation` the real run
+uses, so the printed string and the executed string cannot drift.
+
+Two properties of that emission are worth knowing before trusting it:
+
+- **`--dry-run` is stripped, and only `--dry-run`.** The emitter filters the
+  real argv rather than rebuilding it. Emitting the dry command would be worse
+  than emitting nothing: it looks copy-pasteable, runs cleanly, and transfers
+  not one byte.
+- **A packed share emits one command per pack, not one command.** That is how
+  the pack path really runs — one tar stream per top-level entry, each its own
+  container — so a packed seed is a list to work through, and `direct` shares
+  are the single-command case.
+
+The command is safe to have on screen and in scrollback: credentials never
+appear in it. They reach the container through the env-file streamed into a
+FIFO, which shows up only as `"$ENVF"`, and `buildRcloneInvocation` *refuses*
+to build a command whose argv contains a credential rather than redacting one.
 
 ### 7.4 Handing over to swamp
 

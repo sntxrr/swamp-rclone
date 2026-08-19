@@ -19,15 +19,15 @@ swamp model create @sntxrr/rclone-archive archive-homes \
   --global-arg 'secretAccessKey=${{ vault.get(onepassword, glacier-archive/secret-access-key) }}'
 
 # Rung 1 — what is there, and what would it cost to get back
-swamp model @sntxrr/rclone-archive method run scan archive-homes
+swamp model method run archive-homes scan
 
 # Rung 2 — ALWAYS dry-run first. The first real byte is also the first byte
 # you are committed to paying 180 days for.
-swamp model @sntxrr/rclone-archive method run push archive-homes --input dryRun=true
-swamp model @sntxrr/rclone-archive method run push archive-homes
+swamp model method run archive-homes push --input dryRun=true
+swamp model method run archive-homes push
 
 # Rung 3 — inventory comparison (metadata only)
-swamp model @sntxrr/rclone-archive method run verify archive-homes
+swamp model method run archive-homes verify
 ```
 
 ## The ladder
@@ -95,7 +95,7 @@ compares noise. `verify` therefore compares object count and byte totals, and
 Archive's 40 KB per-object overhead stops being a rounding error.
 
 ```bash
-swamp model @sntxrr/rclone-archive method run push archive-homes \
+swamp model method run archive-homes push \
   --input strategy=pack --input dryRun=true
 ```
 
@@ -120,7 +120,7 @@ Hashing a whole pack proves it downloaded. It does **not** prove it opens. Pass
 `member` and the drill unpacks in flight and hashes just that file:
 
 ```bash
-swamp model @sntxrr/rclone-archive method run restoreDrill archive-homes \
+swamp model method run archive-homes restoreDrill \
   --input objectPath=don.tar \
   --input member=don/Documents/notes.txt \
   --input sourceSha256=<sha>
