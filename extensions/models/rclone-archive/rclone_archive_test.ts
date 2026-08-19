@@ -879,8 +879,51 @@ Deno.test("a shell-entrypoint write without the storage class is refused", async
         entrypoint: "sh",
       }, ["-c", "tar -cf - . | rclone rcat dest:b/x.tar"]),
     Error,
-    "silently land at S3 Standard rates",
+    "--s3-storage-class",
   );
+});
+
+Deno.test("a shell-entrypoint write without --s3-no-check-bucket is refused", async () => {
+  // rclone otherwise tries to CREATE the bucket, and the archive's IAM user
+  // deliberately cannot. That is not theoretical: the entire pack strategy
+  // failed 403 AccessDenied on CreateBucket the first time it ran against S3,
+  // while the direct copy path never triggered it. Refusing at plan time beats
+  // discovering it partway through a multi-terabyte tar stream.
+  await assertRejects(
+    () =>
+      runRclone(CREDS, DEST, {
+        sshHost: "nas.example.invalid",
+        sshBinary: "/bin/false",
+        sourceMount: "/volume1/homes",
+        entrypoint: "sh",
+      }, [
+        "-c",
+        "tar -cf - . | rclone rcat dest:b/x.tar --s3-storage-class DEEP_ARCHIVE",
+      ]),
+    Error,
+    "--s3-no-check-bucket",
+  );
+});
+
+Deno.test("an ordinary argv invocation gets --s3-no-check-bucket injected", () => {
+  const { remote } = buildRcloneInvocation(
+    SEED_CREDS,
+    SEED_DEST,
+    SEED_TRANSPORT,
+    ["copy", "/data", "dest:example-bucket/x"],
+  );
+  assertStringIncludes(remote, "--s3-no-check-bucket");
+});
+
+Deno.test("the pack script names --s3-no-check-bucket inside the script", () => {
+  // Inside, not appended: appended it would be a positional parameter of `sh`.
+  const script = buildPackScript(
+    "member",
+    "dest:example-bucket/x/member.tar",
+    "DEEP_ARCHIVE",
+    smallUpload(),
+  );
+  assertStringIncludes(script, "--s3-no-check-bucket");
 });
 
 Deno.test("a source-only shell invocation needs no storage class", async () => {

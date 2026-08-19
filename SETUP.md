@@ -60,6 +60,28 @@ The key deliberately **cannot delete**. The suite never deletes, so a key that
 *parts of an upload that never completed*, which is cleanup, not data loss.
 Omitting it is actively harmful — see §3.
 
+
+**Do not add `s3:CreateBucket` to make an error go away.** rclone checks the
+bucket exists and tries to CREATE it when that check is inconclusive, and
+`rcat` — which is how every packed upload is written — takes that path for each
+object. With a least-privilege user the result is:
+
+```
+ERROR : _root.tar: Post request rcat error: failed to prepare upload:
+  operation error S3: CreateBucket, StatusCode: 403 ...
+  is not authorized to perform: s3:CreateBucket
+```
+
+The fix is `--s3-no-check-bucket`, which this suite injects on every credentialed
+invocation as of 2026.08.19.4 and REFUSES to run a shell-entrypoint script
+without. The bucket is provisioned out of band in §1, and nothing in the archive
+path should be able to create one — that the policy denies it is the design
+working, not a gap to fill.
+
+Worth knowing why it surfaced so late: `copy` never triggers the bucket check,
+so the direct strategy ran green against real hardware for days. Only the packed
+path hits it, and the packed path was unreachable until 2026.08.19.3.
+
 ## 3. Abort incomplete multipart uploads — this one bites
 
 Every file over `--s3-upload-cutoff` (5 MB by default, so essentially

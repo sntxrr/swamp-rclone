@@ -400,23 +400,42 @@ export function buildRcloneInvocation(
   // to name. Keying on credentials rather than on a caller-supplied "read
   // only" flag means the exemption cannot be claimed by an invocation that
   // could in fact write.
+  //
+  // `--s3-no-check-bucket` is injected on the same terms and for a related
+  // reason. rclone otherwise checks the bucket exists and tries to CREATE it if
+  // the check is inconclusive, and the archive's IAM user deliberately has no
+  // s3:CreateBucket -- the bucket is provisioned out of band (SETUP §1) and
+  // nothing here should be able to make one. `rcat` hits that path on every
+  // object, so the ENTIRE pack strategy failed 403 AccessDenied on CreateBucket
+  // the first time it ever ran against S3, while `copy` never triggered it.
+  // Verified against the live bucket: identical rcat, without the flag 403,
+  // with it the object lands in DEEP_ARCHIVE.
   let argv: string[];
   if (secrets.length === 0) {
     argv = args;
   } else if (transport.entrypoint) {
-    if (!args.join(" ").includes("--s3-storage-class")) {
-      throw new Error(
-        "refusing to run: a shell-entrypoint invocation must name " +
-          "--s3-storage-class inside the script itself. Appending it here " +
-          "would pass it to the shell, not to rclone, and the upload would " +
-          "silently land at S3 Standard rates.",
-      );
+    for (
+      const required of ["--s3-storage-class", "--s3-no-check-bucket"] as const
+    ) {
+      if (!args.join(" ").includes(required)) {
+        throw new Error(
+          `refusing to run: a shell-entrypoint invocation must name ` +
+            `${required} inside the script itself. Appending it here would ` +
+            `pass it to the shell, not to rclone -- which for ` +
+            `--s3-storage-class means the upload silently lands at S3 ` +
+            `Standard rates, and for --s3-no-check-bucket means it fails 403 ` +
+            `on CreateBucket partway through.`,
+        );
+      }
     }
     argv = args;
   } else {
     argv = args.includes("--s3-storage-class")
       ? args
       : [...args, "--s3-storage-class", dest.storageClass];
+    if (!argv.includes("--s3-no-check-bucket")) {
+      argv = [...argv, "--s3-no-check-bucket"];
+    }
   }
 
   // The remote command line. Every word is quoted because ssh hands this to a
@@ -1020,6 +1039,7 @@ export function buildPackScript(
     "set -o pipefail",
     `${tar} | rclone rcat ` +
     `${shQuote(destination)} --s3-storage-class ${shQuote(storageClass)} ` +
+    `--s3-no-check-bucket ` +
     `--s3-chunk-size ${shQuote(String(upload.chunkBytes))} ` +
     `--s3-upload-concurrency ${shQuote(String(upload.uploadConcurrency))}`,
   ].join("\n");
@@ -1043,9 +1063,13 @@ export function buildExtractScript(
   return [
     "set -e",
     "set -o pipefail",
+    // --s3-no-check-bucket is a no-op for a read, and carried anyway: the
+    // runner requires it on every credentialed shell-entrypoint invocation, so
+    // that the next path that WRITES cannot be added without it. Uniform is
+    // worth more here than minimal.
     `rclone cat ${shQuote(object)} --s3-storage-class ${
       shQuote(storageClass)
-    } ` +
+    } --s3-no-check-bucket ` +
     `| tar -xOf - ${shQuote(member)} | sha256sum`,
   ].join("\n");
 }
@@ -1752,7 +1776,7 @@ async function pushPacked(
 
 export const model = {
   type: "@sntxrr/rclone/archive",
-  version: "2026.08.19.3",
+  version: "2026.08.19.4",
   globalArguments: GlobalArgsSchema,
 
   // No-op: this release changes what gets EXCLUDED and how a pack is sized and
@@ -1789,6 +1813,14 @@ export const model = {
         "of falling through to direct and paying the 40 KB per-object " +
         "minimum on every small file. No globalArguments changes -- `auto` " +
         "was already the documented default; it simply was not implemented.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.19.4",
+      description:
+        "Inject --s3-no-check-bucket. Without it rclone tries to CREATE the " +
+        "bucket and the archive's IAM user deliberately cannot, so every " +
+        "packed upload failed 403 on CreateBucket. No globalArguments changes.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
