@@ -3,46 +3,48 @@ import {
   assertEquals,
   assertRejects,
   assertStringIncludes,
+  assertThrows,
 } from "jsr:@std/assert@1";
 import { z } from "npm:zod@4";
 import {
+  ARCHIVE_STORAGE_CLASSES,
+  buildDuScript,
   buildEnvFile,
+  buildExtractScript,
+  buildPackPlan,
+  buildPackScript,
+  buildRcloneInvocation,
+  buildRemoteCommand,
+  buildRestoreArgs,
   chooseStrategy,
   churnFraction,
   classifyFailure,
+  DEFAULT_STORAGE_CLASS,
   destPath,
+  ENV_FIFO_REF,
+  escapeFilterPattern,
+  excludeFlags,
   isInconclusive,
+  isRestoreAlreadyInProgress,
   model,
+  NEVER_ARCHIVE,
   normalisePrefix,
   OBJECT_OVERHEAD_BYTES,
-  parseDu,
-  parseSize,
-  projectCost,
-  buildDuScript,
-  buildPackPlan,
-  buildPackScript,
-  planPackUpload,
-  excludeFlags,
-  NEVER_ARCHIVE,
-  ROOT_PACK_MEMBER,
   PACK_PART_BUDGET,
-  S3_DEFAULT_CHUNK_BYTES,
-  S3_MAX_UPLOAD_PARTS,
-  buildExtractScript,
+  parseDu,
+  parseRestoreStatus,
+  parseSize,
+  planPackUpload,
+  projectCost,
   RCLONE_EXIT,
   type RcloneResult,
   redactSecrets,
+  ROOT_PACK_MEMBER,
   runRclone,
-  shQuote,
-  buildRemoteCommand,
-  ENV_FIFO_REF,
-  DEFAULT_STORAGE_CLASS,
+  S3_DEFAULT_CHUNK_BYTES,
+  S3_MAX_UPLOAD_PARTS,
   S3_STORAGE_CLASSES,
-  ARCHIVE_STORAGE_CLASSES,
-  buildRestoreArgs,
-  parseRestoreStatus,
-  isRestoreAlreadyInProgress,
-  escapeFilterPattern,
+  shQuote,
 } from "./rclone_archive.ts";
 
 const CREDS = {
@@ -134,7 +136,8 @@ function testContext(globalArgs: Record<string, unknown>) {
         instance: string,
         data: Record<string, unknown>,
       ) => {
-        const resource = (model.resources as Record<string, { schema: z.ZodType }>)[spec];
+        const resource =
+          (model.resources as Record<string, { schema: z.ZodType }>)[spec];
         if (!resource) throw new Error(`unknown resource spec "${spec}"`);
         resource.schema.parse(data);
         written.push({ spec, instance, data });
@@ -382,7 +385,10 @@ Deno.test("no credential appears in any written resource", async () => {
 // ---------------------------------------------------------------------------
 
 Deno.test("parseSize reads rclone size --json", () => {
-  assertEquals(parseSize(`{"count":42,"bytes":123}`), { count: 42, bytes: 123 });
+  assertEquals(parseSize(`{"count":42,"bytes":123}`), {
+    count: 42,
+    bytes: 123,
+  });
 });
 
 Deno.test("parseSize tolerates a warning printed ahead of the JSON", () => {
@@ -409,8 +415,14 @@ Deno.test("genuine errors are not inconclusive", () => {
 });
 
 Deno.test("classifyFailure names the codes that matter", () => {
-  assertEquals(classifyFailure(result({ code: RCLONE_EXIT.DIR_NOT_FOUND })), "source-not-found");
-  assertEquals(classifyFailure(result({ code: RCLONE_EXIT.TEMPORARY })), "retries-exhausted");
+  assertEquals(
+    classifyFailure(result({ code: RCLONE_EXIT.DIR_NOT_FOUND })),
+    "source-not-found",
+  );
+  assertEquals(
+    classifyFailure(result({ code: RCLONE_EXIT.TEMPORARY })),
+    "retries-exhausted",
+  );
   assertEquals(classifyFailure(result({ timedOut: true })), "timeout");
 });
 
@@ -420,7 +432,10 @@ Deno.test("classifyFailure names the codes that matter", () => {
 
 Deno.test("small mean file size chooses pack", () => {
   // 500k files averaging 200 KB.
-  assertEquals(chooseStrategy(500_000, 500_000 * 200 * 1024, 1024 * 1024), "pack");
+  assertEquals(
+    chooseStrategy(500_000, 500_000 * 200 * 1024, 1024 * 1024),
+    "pack",
+  );
 });
 
 Deno.test("large mean file size chooses direct", () => {
@@ -464,7 +479,10 @@ Deno.test("churn is null on a first scan and a fraction thereafter", () => {
 
 Deno.test("destPath builds a remote spec with and without a prefix", () => {
   assertEquals(destPath("b", "", "homes"), "dest:b/homes");
-  assertEquals(destPath("b", "nas/volume1", "homes"), "dest:b/nas/volume1/homes");
+  assertEquals(
+    destPath("b", "nas/volume1", "homes"),
+    "dest:b/nas/volume1/homes",
+  );
   assertEquals(destPath("b", "/nas/", "homes"), "dest:b/nas/homes");
   assertEquals(normalisePrefix("//a/b//"), "a/b");
 });
@@ -488,10 +506,15 @@ Deno.test("scan records an unreachable share instead of throwing", async () => {
 
 Deno.test("scan projects cost and raises a churn warning", async () => {
   const ssh = await fakeSsh(`echo '{"count":157000,"bytes":1260000000000}'`);
-  const { written, context } = testContext(baseArgs(ssh.path, { shareName: "mac-backups" }));
+  const { written, context } = testContext(
+    baseArgs(ssh.path, { shareName: "mac-backups" }),
+  );
   try {
     // sparsebundle bands: high churn against a 180-day minimum.
-    await model.methods.scan.execute({ previousBytes: 1_000_000_000_000 }, context);
+    await model.methods.scan.execute(
+      { previousBytes: 1_000_000_000_000 },
+      context,
+    );
     const d = written[0].data as Record<string, number | boolean>;
     assertEquals(d.churnWarning, true);
     assert((d.storageUsdPerMonth as number) > 1);
@@ -575,7 +598,10 @@ Deno.test("pack boundaries do NOT shift when a directory grows", () => {
   // names move when data changes re-uploads everything and pays a fresh
   // 180-day minimum on each replaced object.
   const before = buildPackPlan(
-    [{ name: "a", bytes: 10 }, { name: "b", bytes: 10 }, { name: "c", bytes: 10 }],
+    [{ name: "a", bytes: 10 }, { name: "b", bytes: 10 }, {
+      name: "c",
+      bytes: 10,
+    }],
     0,
   );
   const after = buildPackPlan(
@@ -880,7 +906,9 @@ Deno.test("push in pack mode skips packs whose object already exists", async () 
   *) exit 0 ;;
 esac`,
   );
-  const { written, context } = testContext(baseArgs(ssh.path, { strategy: "pack" }));
+  const { written, context } = testContext(
+    baseArgs(ssh.path, { strategy: "pack" }),
+  );
   try {
     await model.methods.push.execute({}, context);
     const d = written[0].data as Record<string, unknown>;
@@ -902,7 +930,9 @@ Deno.test("push in pack mode uploads a pack that does not yet exist", async () =
   *) exit 0 ;;
 esac`,
   );
-  const { written, context } = testContext(baseArgs(ssh.path, { strategy: "pack" }));
+  const { written, context } = testContext(
+    baseArgs(ssh.path, { strategy: "pack" }),
+  );
   try {
     await model.methods.push.execute({}, context);
     const d = written[0].data as Record<string, unknown>;
@@ -922,7 +952,9 @@ Deno.test("push in pack mode records which packs failed, not just that one did",
   *) echo "tar: read error" >&2; exit 2 ;;
 esac`,
   );
-  const { written, context } = testContext(baseArgs(ssh.path, { strategy: "pack" }));
+  const { written, context } = testContext(
+    baseArgs(ssh.path, { strategy: "pack" }),
+  );
   try {
     await model.methods.push.execute({}, context);
     const d = written[0].data as Record<string, unknown>;
@@ -944,7 +976,9 @@ Deno.test("push in pack dry-run mode uploads nothing", async () => {
   *) exit 0 ;;
 esac`,
   );
-  const { written, context } = testContext(baseArgs(ssh.path, { strategy: "pack" }));
+  const { written, context } = testContext(
+    baseArgs(ssh.path, { strategy: "pack" }),
+  );
   try {
     await model.methods.push.execute({ dryRun: true }, context);
     const d = written[0].data as Record<string, unknown>;
@@ -1070,7 +1104,10 @@ Deno.test("restoreRequest refuses to spend money without acknowledgement", async
   try {
     await assertRejects(
       () =>
-        model.methods.restoreRequest.execute({ objectPath: "a/b.tar" }, context),
+        model.methods.restoreRequest.execute(
+          { objectPath: "a/b.tar" },
+          context,
+        ),
       Error,
       "allowRestore=true",
     );
@@ -1112,7 +1149,10 @@ Deno.test("a clean exit that restored NOTHING is recorded as a failure", async (
     assertEquals(written[0].data.phase, "failed");
     assertEquals(written[0].data.passed, false);
     assertEquals(written[0].data.failureReason, "no-object-matched");
-    assertStringIncludes(String(written[0].data.detail), "path is almost certainly wrong");
+    assertStringIncludes(
+      String(written[0].data.detail),
+      "path is almost certainly wrong",
+    );
   } finally {
     ssh.cleanup();
   }
@@ -1159,7 +1199,10 @@ Deno.test("restoreDrill reports a still-retrieving object as pending", async () 
   );
   const { written, context } = testContext(baseArgs(ssh.path));
   try {
-    await model.methods.restoreDrill.execute({ objectPath: "a/b.tar" }, context);
+    await model.methods.restoreDrill.execute(
+      { objectPath: "a/b.tar" },
+      context,
+    );
     assertEquals(written[0].data.phase, "pending");
     assertEquals(written[0].data.passed, false);
   } finally {
@@ -1168,7 +1211,11 @@ Deno.test("restoreDrill reports a still-retrieving object as pending", async () 
 });
 
 Deno.test("the extract script sets pipefail — a missing member must not hash empty", () => {
-  const s = buildExtractScript("dest:b/x/homes.tar", "homes/don/notes.txt", "GLACIER");
+  const s = buildExtractScript(
+    "dest:b/x/homes.tar",
+    "homes/don/notes.txt",
+    "GLACIER",
+  );
   assertStringIncludes(s, "set -o pipefail");
   // Without pipefail, tar failing on a missing member still lets sha256sum
   // exit 0 having hashed nothing — a green drill for absent data.
@@ -1187,7 +1234,11 @@ esac`,
   const { written, context } = testContext(baseArgs(ssh.path));
   try {
     await model.methods.restoreDrill.execute(
-      { objectPath: "homes.tar", member: "homes/don/notes.txt", sourceSha256: "deadbeef" },
+      {
+        objectPath: "homes.tar",
+        member: "homes/don/notes.txt",
+        sourceSha256: "deadbeef",
+      },
       context,
     );
     const d = written[0].data as Record<string, unknown>;
@@ -1257,10 +1308,13 @@ esac`,
 
 Deno.test("restoreDrill refuses an object above the byte ceiling", async () => {
   const ssh = await fakeSsh(`echo '{"count":1,"bytes":9999999999999}'`);
-  const { context } = testContext(baseArgs(ssh.path, { maxRestoreBytes: 1024 }));
+  const { context } = testContext(
+    baseArgs(ssh.path, { maxRestoreBytes: 1024 }),
+  );
   try {
     await assertRejects(
-      () => model.methods.restoreDrill.execute({ objectPath: "big.tar" }, context),
+      () =>
+        model.methods.restoreDrill.execute({ objectPath: "big.tar" }, context),
       Error,
       "exceeds maxRestoreBytes",
     );
@@ -1553,7 +1607,11 @@ Deno.test("restore roots at the parent directory, not the object", () => {
 });
 
 Deno.test("the include is anchored, or it restores every matching name in the share", () => {
-  const argv = buildRestoreArgs("dest:b/share", "deep/nested/chords.mid", "Bulk");
+  const argv = buildRestoreArgs(
+    "dest:b/share",
+    "deep/nested/chords.mid",
+    "Bulk",
+  );
   const include = argv[argv.indexOf("--include") + 1];
   // Unanchored, this matches chords.mid at ANY depth — and every object it
   // matches is retrieved and billed.
@@ -1612,11 +1670,125 @@ Deno.test("a filter that matched nothing parses as zero rows, not as success", (
 });
 
 Deno.test("leading notices before the JSON do not defeat the parser", () => {
-  const out = `2026/08/15 23:11:57 NOTICE: Config file not found - using defaults
+  const out =
+    `2026/08/15 23:11:57 NOTICE: Config file not found - using defaults
 [
 { "Status": "OK", "Remote": "kick.wav" }
 ]`;
   const rows = parseRestoreStatus(out);
   assertEquals(rows.length, 1);
   assertEquals(rows[0].status, "OK");
+});
+
+// ---------------------------------------------------------------------------
+// The seed command (SETUP §7.3)
+// ---------------------------------------------------------------------------
+//
+// The seed is started by pasting a command into a shell on the NAS, so the
+// command this emits IS the archive's storage-class guarantee for the largest
+// transfer the suite ever performs. These pin the properties that make it safe
+// to print and safe to paste.
+
+const SEED_CREDS = {
+  accessKeyId: "AKIAEXAMPLEEXAMPLE00",
+  secretAccessKey: "s3cr3t-example-value-not-real-0000000000",
+};
+const SEED_DEST = {
+  bucket: "example-bucket",
+  region: "us-west-2",
+  storageClass: "DEEP_ARCHIVE",
+};
+const SEED_TRANSPORT = {
+  sshHost: "nas",
+  sourceMount: "/volume1/example-share",
+};
+
+Deno.test("the emitted command names the storage class", () => {
+  const { remote } = buildRcloneInvocation(
+    SEED_CREDS,
+    SEED_DEST,
+    SEED_TRANSPORT,
+    ["copy", "/data", "dest:example-bucket/x"],
+  );
+  assertStringIncludes(remote, "--s3-storage-class");
+  assertStringIncludes(remote, "DEEP_ARCHIVE");
+});
+
+Deno.test("the emitted command carries no credential, so it is safe to log", () => {
+  const { remote, secrets } = buildRcloneInvocation(
+    SEED_CREDS,
+    SEED_DEST,
+    SEED_TRANSPORT,
+    ["copy", "/data", "dest:example-bucket/x"],
+  );
+  assert(!remote.includes(SEED_CREDS.accessKeyId));
+  assert(!remote.includes(SEED_CREDS.secretAccessKey));
+  // They reach the container through the FIFO, which appears only as $ENVF.
+  assertStringIncludes(remote, "--env-file");
+  assertEquals(secrets.length, 2);
+});
+
+Deno.test("a credential in argv is refused rather than printed", () => {
+  // Refusing is what makes the line above a guarantee instead of a hope: there
+  // is no argv that both reaches S3 and contains a secret to leak.
+  assertThrows(() =>
+    buildRcloneInvocation(SEED_CREDS, SEED_DEST, SEED_TRANSPORT, [
+      "copy",
+      "/data",
+      `dest:${SEED_CREDS.secretAccessKey}`,
+    ])
+  );
+});
+
+Deno.test("stripping --dry-run yields the command that really transfers", () => {
+  // The emitter filters the REAL argv rather than rebuilding it, so the printed
+  // command can differ from the executed one in exactly one flag and no other.
+  const argv = ["copy", "/data", "dest:example-bucket/x", "--dry-run"];
+  const dry = buildRcloneInvocation(
+    SEED_CREDS,
+    SEED_DEST,
+    SEED_TRANSPORT,
+    argv,
+  ).remote;
+  const real = buildRcloneInvocation(
+    SEED_CREDS,
+    SEED_DEST,
+    SEED_TRANSPORT,
+    argv.filter((a) => a !== "--dry-run"),
+  ).remote;
+
+  assertStringIncludes(dry, "--dry-run");
+  assert(!real.includes("--dry-run"));
+  assertEquals(real, dry.replace(" '--dry-run'", ""));
+  // Still archived correctly once the flag is gone -- that is the whole risk.
+  assertStringIncludes(real, "--s3-storage-class");
+});
+
+Deno.test("a packed seed command inlines the class, since the flag would hit the shell", () => {
+  // The pack path runs `sh -c '<script>'`, so an appended flag would become a
+  // positional parameter of the shell and rclone would never see it. The
+  // builder refuses that shape unless the script names the class itself.
+  const script = buildPackScript(
+    "member",
+    "dest:example-bucket/x/member.tar",
+    "DEEP_ARCHIVE",
+    smallUpload(),
+  );
+  const { remote } = buildRcloneInvocation(
+    SEED_CREDS,
+    SEED_DEST,
+    { ...SEED_TRANSPORT, entrypoint: "sh" },
+    ["-c", script],
+  );
+  assertStringIncludes(remote, "--s3-storage-class");
+  assertStringIncludes(remote, "--entrypoint");
+
+  assertThrows(() =>
+    buildRcloneInvocation(
+      SEED_CREDS,
+      SEED_DEST,
+      { ...SEED_TRANSPORT, entrypoint: "sh" },
+      ["-c", "rclone rcat dest:example-bucket/x/member.tar"],
+    )
+  );
 });
