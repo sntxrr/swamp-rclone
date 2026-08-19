@@ -1,7 +1,7 @@
 manifestVersion: 1
 
 name: "@sntxrr/rclone-archive"
-version: "2026.08.19.1"
+version: "2026.08.19.2"
 description: "Archive a Synology share to S3 Glacier Deep Archive with rclone, driven over SSH into a container on the NAS so no binary is installed on DSM. A cost-ordered ladder — inventory and cost projection, copy, metadata verification, then a two-phase restore drill that is the only rung proving recovery. Never deletes: sync, move and purge are refused at the runner, because a source that fails to mount presents as empty and sync would empty the destination unrecoverably while still billing the 180-day minimum."
 repository: "https://github.com/sntxrr/swamp-rclone"
 
