@@ -1017,13 +1017,47 @@ export function planPackUpload(
  *     few kilobytes and the stream dies at part 10 000 — the same unknown-size
  *     ceiling documented on that function, reached from the other direction.
  *
- * `--no-recursion` with an explicit `./*` glob is the fix: files are archived
- * whole, directories are archived as bare entries without their contents. The
- * `cd` is required and is not the same as `-C` — `-C` positions tar, but the
- * glob is expanded by the SHELL, so with `-C` alone `./*` expands in whatever
- * directory the shell started in and tar reports "./*: No such file or
- * directory". The glob also survives names containing spaces, which `volume1`
- * has, because shell globbing does not word-split its results.
+ * The member list therefore comes from `find . -maxdepth 1 -type f` piped into
+ * tar's `-T -`, which is the SAME expression {@link buildDuScript} uses to
+ * compute `looseFileBytes`. That agreement is the point: the rung that decides
+ * a `_root` pack is worth making and the rung that builds it now select the
+ * same set, so the plan cannot promise bytes the tar does not ship.
+ *
+ * **This replaced a `--no-recursion` + `./*` shell glob, which silently dropped
+ * every dotfile in the share root.** A shell glob does not match leading dots,
+ * so `.DS_Store` and friends were never archived — while `looseFileBytes`,
+ * computed with `find -type f`, DID count them. The two rungs disagreed, and
+ * the disagreement was invisible: the pack reported `packsUploaded`, the
+ * transfer resource reported `passed: true`, and the object was a well-formed
+ * tar that happened to omit the files. Found 2026-08-19 on `web_packages`,
+ * whose `_root.tar` reached Deep Archive holding no file content at all. On a
+ * share root of nothing but dotfiles it is total, silent loss — and Deep
+ * Archive's 180-day minimum plus this suite's lack of `s3:DeleteObject` makes
+ * it uncorrectable after the fact.
+ *
+ * Two lesser defects fell out with it. The glob also matched DIRECTORIES, so
+ * `--no-recursion` was needed to stop `_root` becoming a second full copy of
+ * the share (see above) — and `@eaDir` still leaked in as a bare entry,
+ * because `--exclude '@eaDir/**'` matches a path BENEATH the directory and not
+ * the directory itself. `-type f` removes both concerns at the source rather
+ * than patching around them: directories are never candidates, so nothing
+ * recurses and nothing needs excluding. The excludes are retained as defence.
+ *
+ * The `cd` is still required and is still not the same as `-C`: `find` is what
+ * resolves the paths now, and the names it emits are relative to the shell's
+ * directory, not tar's.
+ *
+ * Busybox tar has `-T` but NOT `--null`, so the list is newline-separated. That
+ * handles spaces — which `volume1` has — but not a filename containing a
+ * newline, which busybox gives no way to express. Such a name would break the
+ * pack loudly under `pipefail` rather than silently, which is the tolerable
+ * direction.
+ *
+ * With no loose files at all, busybox tar exits 1 (`tar: empty archive`) and
+ * `pipefail` fails the pack. {@link buildPackPlan} only emits `_root` when
+ * `looseFileBytes > 0`, so this is unreachable unless the file vanishes between
+ * the two rungs — and failing loudly on that race is correct, where the old
+ * glob would have uploaded a tar of bare directory entries and called it done.
  */
 export function buildPackScript(
   member: string,
@@ -1032,7 +1066,7 @@ export function buildPackScript(
   upload: Extract<PackUploadPlan, { streamable: true }>,
 ): string {
   const tar = member === ROOT_PACK_MEMBER
-    ? `cd /data && tar ${tarExcludeArgs()} --no-recursion -cf - ./*`
+    ? `cd /data && find . -maxdepth 1 -type f | tar ${tarExcludeArgs()} -T - -cf -`
     : `tar -C /data ${tarExcludeArgs()} -cf - ${shQuote(member)}`;
   return [
     "set -e",
@@ -1776,7 +1810,7 @@ async function pushPacked(
 
 export const model = {
   type: "@sntxrr/rclone/archive",
-  version: "2026.08.19.4",
+  version: "2026.08.19.5",
   globalArguments: GlobalArgsSchema,
 
   // No-op: this release changes what gets EXCLUDED and how a pack is sized and
@@ -1821,6 +1855,17 @@ export const model = {
         "Inject --s3-no-check-bucket. Without it rclone tries to CREATE the " +
         "bucket and the archive's IAM user deliberately cannot, so every " +
         "packed upload failed 403 on CreateBucket. No globalArguments changes.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.19.5",
+      description:
+        "The _root pack archives dotfiles. It was built from a `./*` shell " +
+        "glob, which does not match a leading dot, so every dotfile in a " +
+        "share root was silently omitted while looseFileBytes still counted " +
+        "it -- a pack reporting success and missing files. Now selected with " +
+        "`find -maxdepth 1 -type f`, the same expression that measures it. " +
+        "No globalArguments changes.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
