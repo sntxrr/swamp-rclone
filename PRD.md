@@ -241,8 +241,19 @@ already has a pack of its own, making `_root.tar` a second full copy of the
 share. On a small share that upload *succeeds*, and the share is stored twice at
 the 180-day minimum; on a large one it fails, but only after moving terabytes,
 because `_root` is sized from the loose-file total and so picks chunks for a few
-kilobytes and dies at part 10 000. The pack is built with `--no-recursion` over
-an explicit glob instead: files whole, directories as bare entries.
+kilobytes and dies at part 10 000. The pack is built from
+`find . -maxdepth 1 -type f` piped into tar's `-T -` instead: only loose files
+are candidates, so nothing recurses.
+
+**`_root` must archive dotfiles, and a shell glob does not.** The pack was
+originally `--no-recursion` over an explicit `./*` glob, which matches no
+leading dot — so every dotfile in a share root was omitted while
+`looseFileBytes`, computed with `find -type f`, still counted it. The two rungs
+disagreed silently: the pack reported success and the object was a valid tar
+missing the files. Found on `web_packages` after it had already reached Deep
+Archive, where the 180-day minimum and the absence of `s3:DeleteObject` make it
+uncorrectable in place. Selecting with the *same* `find` expression the sizing
+uses is what makes the two agree by construction.
 
 **Loose files must not also be entries.** Sizing globs directories only. With a
 bare glob each loose file is reported as its own entry and becomes its own

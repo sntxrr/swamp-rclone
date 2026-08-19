@@ -698,13 +698,63 @@ Deno.test("the _root pack does NOT tar the whole share", () => {
     "DEEP_ARCHIVE",
     smallUpload(),
   );
-  assertStringIncludes(script, "--no-recursion");
-  assertStringIncludes(script, "./*");
+  // -type f is what guarantees it now: a directory is never a candidate, so
+  // there is nothing to recurse into and --no-recursion is not needed.
+  assertStringIncludes(script, "-maxdepth 1 -type f");
   assertEquals(script.includes("-cf - '.'"), false);
-  // The cd is not interchangeable with -C: -C positions tar, but the glob is
-  // expanded by the SHELL, so with -C alone `./*` expands in the wrong place
-  // and tar reports "./*: No such file or directory".
-  assertStringIncludes(script, "cd /data && tar");
+  assertEquals(script.includes("--no-recursion"), false);
+  // The cd is not interchangeable with -C: find resolves the paths, and the
+  // names it emits are relative to the SHELL's directory, not tar's.
+  assertStringIncludes(script, "cd /data && find .");
+});
+
+Deno.test("the _root pack archives dotfiles — a shell glob silently dropped them", () => {
+  // The bug this replaced. `./*` does not match a leading dot, so every
+  // dotfile in a share root was omitted from _root.tar while looseFileBytes —
+  // computed with `find -type f`, which DOES see them — still counted them.
+  // Both rungs reported success and the object was a valid tar missing the
+  // files. web_packages reached Deep Archive that way on 2026-08-19, and with
+  // no s3:DeleteObject and a 180-day minimum it cannot be corrected in place.
+  const script = buildPackScript(
+    ROOT_PACK_MEMBER,
+    "dest:b/x/_root.tar",
+    "DEEP_ARCHIVE",
+    smallUpload(),
+  );
+  // A glob would reintroduce it, so assert its absence rather than trusting
+  // the find expression to stay.
+  assertEquals(script.includes("./*"), false);
+  assertStringIncludes(script, "find . -maxdepth 1 -type f | tar");
+});
+
+Deno.test("the _root pack selects the same set buildDuScript measures", () => {
+  // The invariant the old code broke: the rung that decides _root is worth
+  // making and the rung that builds it must agree, or the plan promises bytes
+  // the tar does not ship.
+  const script = buildPackScript(
+    ROOT_PACK_MEMBER,
+    "dest:b/x/_root.tar",
+    "DEEP_ARCHIVE",
+    smallUpload(),
+  );
+  const du = buildDuScript();
+  const expr = "-maxdepth 1 -type f";
+  assertStringIncludes(script, expr);
+  assertStringIncludes(du, expr);
+});
+
+Deno.test("the _root pack feeds tar a list, not arguments — busybox has no --null", () => {
+  const script = buildPackScript(
+    ROOT_PACK_MEMBER,
+    "dest:b/x/_root.tar",
+    "DEEP_ARCHIVE",
+    smallUpload(),
+  );
+  // -T - reads newline-separated names, which handles the spaces volume1 has.
+  // --null is GNU-only and busybox tar rejects it outright.
+  assertStringIncludes(script, "-T - -cf -");
+  assertEquals(script.includes("--null"), false);
+  assertEquals(script.includes("-print0"), false);
 });
 
 Deno.test("a normal pack still tars its member, not the share root", () => {

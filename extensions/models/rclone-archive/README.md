@@ -107,7 +107,10 @@ fresh 180-day minimum on each replaced object. `homes` gives one pack per user,
 the granularity you would actually want to restore at.
 
 Loose files in the share root are collected into a single `_root.tar` so they
-are neither skipped nor turned into one object each.
+are neither skipped nor turned into one object each. Its members come from
+`find . -maxdepth 1 -type f` — the same expression that sizes the pack — so
+**dotfiles are included**; the `./*` shell glob used before 2026.08.19.5
+silently dropped them.
 
 Existing packs are **skipped**, not replaced. Pass `--input repack=true` to
 replace one deliberately — on Deep Archive a replacement deletes the old object
