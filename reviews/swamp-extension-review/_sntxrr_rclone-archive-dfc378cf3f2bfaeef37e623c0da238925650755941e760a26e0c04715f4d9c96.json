@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/rclone-archive",
+  "version": "2026.08.19.3",
+  "reviewedAt": "2026-08-19T19:40:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "No change to credential handling, and the one new remote call is deliberately credential-free: the auto-strategy measurement is `rclone size` on /data, invoked with NO_CREDENTIALS, the same source-only shape scan uses. So the NAS receives no AWS key to answer a question the NAS can answer alone. Everything from .2 stands: the argv check REFUSES rather than redacts, credentials travel as a docker --env-file streamed into a 0600 FIFO and reach neither argv nor the NAS filesystem, stderr is redacted at the subprocess boundary, a newline in a credential is rejected rather than truncated, and the printed seed command and env template contain placeholders only."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "The auto decision is logged with the evidence behind it -- file count, mean bytes, and the threshold it was compared against -- rather than as a bare verdict, so an operator can see WHY a share packed or did not, and disagree. That matters more here than usual, because the bug being fixed was two rungs silently disagreeing about exactly this. A measurement failure logs a warning naming the classified reason and what to do about it (pin the strategy), instead of proceeding on a guess."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "The new failure mode is handled in the suite's established style rather than by throwing: an unmeasurable share writes a transfer resource with passed=false, inconclusive=true and failureReason 'strategy-undetermined: <classified reason>', so a fleet report sees it. inconclusive is the correct field -- nothing was attempted and nothing is known, which is distinct from a transfer that failed. Refusing is the deliberate choice over both defaults: direct would be the original bug wearing a comment, pack would tar a share whose size we just failed to establish."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "128 tests, confirmed by exit status, up from 124. Four new cover the decision itself: auto picks pack below the threshold and direct above it, a pinned strategy performs NO measurement at all (asserted by recording every ssh invocation, since the escape hatch existing but not working would be silent), and an unmeasurable share refuses rather than defaulting either way. THE MORE IMPORTANT TESTING FINDING IS ABOUT THE OLD TESTS: six existing push tests broke against the fix, and they broke because they were passing BECAUSE of the bug -- each asserts direct-copy flags while feeding a fixture whose mean file size selects pack, so they only ever reached the copy path via the fall-through. They are now pinned to strategy=direct and test the path they claim to. That is worth stating plainly rather than burying: the suite had six tests over a code path that production could reach only by accident, and none of them noticed. Flagged in the PR for human review, because pinning tests to make them pass is exactly the shape of a change that can hide a regression."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Unchanged in substance: copy never sync, nine destructive subcommands refused at the runner, --immutable by default, --no-traverse coupled to --max-age, restoreRequest idempotent, restore filters anchored and glob-escaped, #recycle and @eaDir excluded consistently. The measurement is read-only and side-effect-free, and it runs before anything is written, so a repeated push makes the same decision from the same source state. Honest note: the decision is now a function of the share's CURRENT shape, so a share whose mean file size crosses the threshold will switch strategy between runs and write the other object layout alongside the first. Pinning strategy is the answer where that matters, and SETUP says so."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "No rclone or S3 contract changed. What changed is that a contract this extension declares about ITSELF is now honoured: the strategy argument documented auto as the default that picks from mean file size, and the code did not implement it. The gap had survived three releases and an adversarial review each time, which is worth recording -- every review read the description and the chooseStrategy helper, and none traced whether push actually called it. A documented default is a contract, and this one was fiction."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "The measurement adds one source-side walk per auto push. It is not free -- on a multi-terabyte share it is a full tree walk -- and it is bounded by the same six-hour AbortController as every other call. Pinning strategy skips it entirely, which is the documented answer for a scheduled incremental run, and that escape hatch is now covered by a test rather than trusted. Everything else stands: trap-based temp dir cleanup, the FIFO writer killed rather than waited on, the pack memory budget that refuses rather than OOMing a NAS with ~3 GB free."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Re-audited per-file across the four shipped files with a control match first; the test file is present in the directory but not shipped. Scanned for host, domain, bucket, LAN range and sixteen real share names -- including the ten scanned live today -- with zero hits. The three pre-existing accepted identifiers are unchanged and this release adds none. The runtime disclosure recorded in .2 is unchanged: the emitted seed command carries the bucket, prefix, ssh host and mount path, and dryRun run logs persist."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "zod v4 throughout; the test context parses through the real resource schemas, so a drifting shape fails the suite rather than reaching the datastore. No schema changed. The strategy argument's DESCRIPTION changed to state that pinning skips a full source walk, which is the kind of thing an operator can only otherwise learn from a slow run. Model version and manifest version were checked against each other and both read 2026.08.19.3."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "Unchanged. All four specs lifetime infinite with garbageCollection 50, deliberate for an archive of last resort: the records are the audit trail and churn reads the previous scan."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "na",
+      "note": "Still deliberately not a CRUD model. A cost-ordered verification ladder over a destination it must never mutate destructively. This release adds a read-only measurement and changes no write surface."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "The three checks are untouched and passed on live instances today. The measurement is itself a de facto preflight -- it now runs before any byte moves on an auto push, and its failure stops the transfer rather than letting it proceed on an assumed layout."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Untouched and the distinctness test still passes. Object names are unaffected BY THE CODE, but this release changes which LAYOUT a share gets, which is the thing to watch: a share that archived direct before will archive as packs afterwards, under different object names, and the earlier objects remain (this suite cannot delete). SETUP \u00a76 records that consequence and its 180-day cost."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Untouched. Churn wiring still uses data.latest(<model>, <RESOURCE INSTANCE>), and the previous byte total is still passed in as an argument rather than read by the model -- which is precisely why push measures for itself here instead of reading the last scan's inventory. Recording that constraint, because 'just read the scan resource' is the obvious fix and the context API does not offer it."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "Handled. Upgrades entries exist for 2026.08.19.1, .2 and .3, each returning globalArguments unchanged, because no field was added, renamed, removed or retyped -- auto was already the documented default and only its implementation changed. The .1 entry is retained though .1 was never published: entries are filtered by toVersion > typeVersion, so a retained no-op is harmless while removing it would bet that no instance anywhere recorded that typeVersion. Verified live today that the mechanism works -- seventeen instances created this session all record 2026.08.19.2, and one older instance moved itself forward on its first run."
+    }
+  ]
+}

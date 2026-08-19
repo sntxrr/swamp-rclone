@@ -526,7 +526,11 @@ Deno.test("scan projects cost and raises a churn warning", async () => {
 
 Deno.test("push records exit 9 as nothing-to-transfer, not as a failure", async () => {
   const ssh = await fakeSsh("exit 9");
-  const { written, context } = testContext(baseArgs(ssh.path));
+  // strategy pinned: this asserts the DIRECT copy path, and must not depend on
+  // what an auto measurement would have chosen.
+  const { written, context } = testContext(
+    baseArgs(ssh.path, { strategy: "direct" }),
+  );
   try {
     await model.methods.push.execute({}, context);
     const d = written[0].data as Record<string, unknown>;
@@ -540,7 +544,9 @@ Deno.test("push records exit 9 as nothing-to-transfer, not as a failure", async 
 
 Deno.test("push asks for exit 9 — without the flag it cannot tell", async () => {
   const ssh = await fakeSsh("exit 0");
-  const { context } = testContext(baseArgs(ssh.path));
+  const { context } = testContext(
+    baseArgs(ssh.path, { strategy: "direct" }),
+  );
   try {
     await model.methods.push.execute({}, context);
     assertStringIncludes(ssh.argv().at(-1) ?? "", "--error-on-no-transfer");
@@ -551,7 +557,9 @@ Deno.test("push asks for exit 9 — without the flag it cannot tell", async () =
 
 Deno.test("push copies and never syncs", async () => {
   const ssh = await fakeSsh("exit 0");
-  const { context } = testContext(baseArgs(ssh.path));
+  const { context } = testContext(
+    baseArgs(ssh.path, { strategy: "direct" }),
+  );
   try {
     await model.methods.push.execute({}, context);
     const remote = ssh.argv().at(-1) ?? "";
@@ -1014,7 +1022,9 @@ Deno.test("a full push traverses rather than HEADing every file", async () => {
 
 Deno.test("a windowed push enables --no-traverse, and only then", async () => {
   const ssh = await fakeSsh("exit 0");
-  const { context } = testContext(baseArgs(ssh.path));
+  const { context } = testContext(
+    baseArgs(ssh.path, { strategy: "direct" }),
+  );
   try {
     await model.methods.push.execute({ maxAgeMinutes: 120 }, context);
     const remote = ssh.argv().at(-1) ?? "";
@@ -1027,7 +1037,9 @@ Deno.test("a windowed push enables --no-traverse, and only then", async () => {
 
 Deno.test("the window can be set on the model, not just per run", async () => {
   const ssh = await fakeSsh("exit 0");
-  const { context } = testContext(baseArgs(ssh.path, { maxAgeMinutes: 90 }));
+  const { context } = testContext(
+    baseArgs(ssh.path, { maxAgeMinutes: 90, strategy: "direct" }),
+  );
   try {
     await model.methods.push.execute({}, context);
     assertStringIncludes(ssh.argv().at(-1) ?? "", "'--max-age' '90m'");
@@ -1038,7 +1050,9 @@ Deno.test("the window can be set on the model, not just per run", async () => {
 
 Deno.test("--immutable is on by default and removable only deliberately", async () => {
   const ssh = await fakeSsh("exit 0");
-  const { context } = testContext(baseArgs(ssh.path));
+  const { context } = testContext(
+    baseArgs(ssh.path, { strategy: "direct" }),
+  );
   try {
     await model.methods.push.execute({}, context);
     assertStringIncludes(ssh.argv().at(-1) ?? "", "--immutable");
@@ -1835,4 +1849,93 @@ Deno.test("the emitted command really does read its credentials from stdin", () 
   assertStringIncludes(remote, "exec 3<&0");
   assertStringIncludes(remote, "mkfifo");
   assertStringIncludes(remote, "--env-file");
+});
+
+// ---------------------------------------------------------------------------
+// push must resolve the `auto` strategy, not fall through to direct
+// ---------------------------------------------------------------------------
+//
+// The fall-through was the worst shape a cost bug can take: scan computed the
+// decision correctly and said pack, push silently did direct, and both rungs
+// reported success. Packing exists only to amortise the 40 KB per-object
+// billing minimum, so on a small-file share that is the minimum paid per file.
+
+/** A fake ssh that records every invocation, so "did it measure?" is testable. */
+async function countingSsh(script: string) {
+  const log = await Deno.makeTempFile({ prefix: "rclone-calls-" });
+  const ssh = await fakeSsh(`printf '%s\\n' "$*" >> ${log}\n${script}`);
+  return {
+    ...ssh,
+    calls: () =>
+      Deno.readTextFileSync(log).split("\n").filter((l) => l.length > 0),
+    cleanup: () => {
+      ssh.cleanup();
+      try {
+        Deno.removeSync(log);
+      } catch { /* already gone */ }
+    },
+  };
+}
+
+Deno.test("auto picks pack when the mean file size is below the threshold", async () => {
+  // 1000 B over 10 files = 100 B mean, far under the 1 MiB default.
+  const ssh = await countingSsh(`echo '{"count":10,"bytes":1000}'`);
+  const { written, context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.push.execute({ dryRun: true }, context);
+    assertEquals(written.length, 1);
+    assertEquals(written[0].data.strategy, "pack");
+    assert(
+      ssh.calls().some((c) => c.includes("size")),
+      "auto must MEASURE; a decision made without measuring is the old bug",
+    );
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("auto picks direct when the mean file size is above the threshold", async () => {
+  // 10 GB over 10 files = 1 GB mean.
+  const ssh = await countingSsh(`echo '{"count":10,"bytes":10000000000}'`);
+  const { written, context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.push.execute({ dryRun: true }, context);
+    assertEquals(written.length, 1);
+    assertEquals(written[0].data.strategy, "direct");
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("an explicitly pinned strategy skips the measurement entirely", async () => {
+  // The measurement is a full source walk, so pinning has to actually avoid it
+  // -- otherwise the escape hatch for a scheduled incremental run does nothing.
+  const ssh = await countingSsh(`echo '{"count":10,"bytes":1000}'`);
+  const { context } = testContext(baseArgs(ssh.path, { strategy: "direct" }));
+  try {
+    await model.methods.push.execute({ dryRun: true }, context);
+    assert(
+      !ssh.calls().some((c) => c.includes("size")),
+      "a pinned strategy must not pay for a source walk it does not need",
+    );
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("an unmeasurable share refuses rather than defaulting either way", async () => {
+  // Defaulting to direct here would be the original bug wearing a comment, and
+  // defaulting to pack would tar a share whose size we just failed to establish.
+  const ssh = await countingSsh("exit 3");
+  const { written, context } = testContext(baseArgs(ssh.path));
+  try {
+    await model.methods.push.execute({}, context);
+    assertEquals(written.length, 1);
+    const d = written[0].data as Record<string, unknown>;
+    assertEquals(d.passed, false);
+    assertEquals(d.inconclusive, true);
+    assertStringIncludes(String(d.failureReason), "strategy-undetermined");
+  } finally {
+    ssh.cleanup();
+  }
 });
