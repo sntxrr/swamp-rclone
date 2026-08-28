@@ -864,6 +864,43 @@ Deno.test("the pack script names a chunk size — a streamed tar never auto-scal
   assertStringIncludes(script, "--s3-upload-concurrency");
 });
 
+Deno.test("the chunk size carries an explicit byte unit — bare integers mean KiB", () => {
+  // The bug this pins down: rclone reads a unit-less SizeSuffix as KiB, so the
+  // raw byte count asked for 1024x the planned buffer. A 5 MiB chunk went out
+  // as `--s3-chunk-size 5242880`, which rclone read as 5 GiB -- matching the
+  // single 5 GiB part S3 recorded and the 4.7 GB RSS measured on the NAS.
+  //
+  // Asserting the flag is merely PRESENT is what let this through, so assert
+  // the unit, and assert the wrong form is absent.
+  const plan = smallUpload();
+  const script = buildPackScript(
+    "homes",
+    "dest:b/x/homes.tar",
+    "DEEP_ARCHIVE",
+    plan,
+  );
+  assertStringIncludes(script, `--s3-chunk-size '${plan.chunkBytes}B'`);
+  assertEquals(script.includes(`--s3-chunk-size '${plan.chunkBytes}'`), false);
+});
+
+Deno.test("every chunk size rclone is given is unit-qualified, at any scale", () => {
+  // Scaling is where it bites hardest: the larger the pack, the larger the
+  // chunk, so a unit-less value overshoots by 1024x on exactly the uploads
+  // least able to absorb it.
+  for (const bytes of [1024, 30 * 1024 ** 3, 400 * 1024 ** 3, 3 * 1024 ** 4]) {
+    const plan = planPackUpload(bytes, 64 * 1024 ** 3);
+    if (!plan.streamable) continue;
+    const script = buildPackScript("m", "dest:b/x/m.tar", "DEEP_ARCHIVE", plan);
+    const flag = script.match(/--s3-chunk-size '([^']+)'/);
+    assertEquals(flag !== null, true, `no chunk size flag for ${bytes} bytes`);
+    assertEquals(
+      /^\d+B$/.test(flag![1]),
+      true,
+      `chunk size ${flag![1]} for ${bytes} bytes lacks an explicit byte unit`,
+    );
+  }
+});
+
 Deno.test("a pack inside the default chunk's reach is left at rclone's default", () => {
   // The part budget, not the 10 000-part limit, sets where scaling begins:
   // 8 000 x 5 MiB = 39.06 GiB.
