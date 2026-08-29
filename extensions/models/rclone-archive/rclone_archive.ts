@@ -1071,10 +1071,20 @@ export function buildPackScript(
   return [
     "set -e",
     "set -o pipefail",
+    // The `B` on --s3-chunk-size is load-bearing, not decoration. rclone parses
+    // a SizeSuffix option with no unit as KiB ("specified as an integer value,
+    // which will then be assumed to represent a KiB value"), so passing the raw
+    // byte count silently asked for 1024x what planPackUpload budgeted: a 5 MiB
+    // chunk went out as `--s3-chunk-size 5242880` = 5 242 880 KiB = exactly
+    // 5 GiB. That is not a theory. S3 recorded a single 5 GiB part, rclone's RSS
+    // was measured at 4.7 GB against 192 MB for the same data via `direct`, and
+    // with the planned concurrency of 4 the real ask was ~20 GiB of buffers on
+    // an 8 GB NAS -- which is what OOM-killed Container Manager twice and is why
+    // `pack` was written off as unusable on this hardware.
     `${tar} | rclone rcat ` +
     `${shQuote(destination)} --s3-storage-class ${shQuote(storageClass)} ` +
     `--s3-no-check-bucket ` +
-    `--s3-chunk-size ${shQuote(String(upload.chunkBytes))} ` +
+    `--s3-chunk-size ${shQuote(`${upload.chunkBytes}B`)} ` +
     `--s3-upload-concurrency ${shQuote(String(upload.uploadConcurrency))}`,
   ].join("\n");
 }
@@ -1810,7 +1820,7 @@ async function pushPacked(
 
 export const model = {
   type: "@sntxrr/rclone/archive",
-  version: "2026.08.19.5",
+  version: "2026.08.27.1",
   globalArguments: GlobalArgsSchema,
 
   // No-op: this release changes what gets EXCLUDED and how a pack is sized and
@@ -1866,6 +1876,16 @@ export const model = {
         "it -- a pack reporting success and missing files. Now selected with " +
         "`find -maxdepth 1 -type f`, the same expression that measures it. " +
         "No globalArguments changes.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.27.1",
+      description:
+        "--s3-chunk-size is now passed with an explicit B suffix. rclone " +
+        "reads a unit-less SizeSuffix as KiB, so the raw byte count asked " +
+        "for 1024x the planned buffer: a 5 MiB chunk went out as 5242880, " +
+        "which rclone read as 5 GiB. That is what made `pack` OOM the NAS " +
+        "and look unusable. No globalArguments changes.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
