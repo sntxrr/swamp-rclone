@@ -1820,7 +1820,7 @@ async function pushPacked(
 
 export const model = {
   type: "@sntxrr/rclone/archive",
-  version: "2026.08.27.1",
+  version: "2026.08.29.1",
   globalArguments: GlobalArgsSchema,
 
   // No-op: this release changes what gets EXCLUDED and how a pack is sized and
@@ -1879,7 +1879,7 @@ export const model = {
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
     {
-      toVersion: "2026.08.27.1",
+      toVersion: "2026.08.29.1",
       description:
         "--s3-chunk-size is now passed with an explicit B suffix. rclone " +
         "reads a unit-less SizeSuffix as KiB, so the raw byte count asked " +
