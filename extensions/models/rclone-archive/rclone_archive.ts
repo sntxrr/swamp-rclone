@@ -154,13 +154,45 @@ export const NEVER_ARCHIVE = ["#recycle", "@eaDir"];
  * checkout, a tool's cache — silently omitting unrelated data while `verify`
  * still passed, because verify applies the same filter to both sides.
  */
-export function excludeFlags(extra: readonly string[] = []): string[] {
+export function excludeFlags(
+  extra: readonly string[] = [],
+  patterns: readonly string[] = [],
+): string[] {
   return [
     ...NEVER_ARCHIVE.flatMap((name) => ["--exclude", `${name}/**`]),
     ...normalizeExcludePaths(extra).flatMap((
       p,
     ) => ["--exclude", `/${p}/**`, "--exclude", `/${p}`]),
+    ...normalizePatterns(patterns).flatMap((p) => ["--exclude", p]),
   ];
+}
+
+/**
+ * Normalise operator-supplied FILTER PATTERNS.
+ *
+ * Passed to rclone verbatim, deliberately UNANCHORED, and that is the whole
+ * point of having them alongside {@link normalizeExcludePaths}. A path exclude
+ * answers "not that tree"; a pattern answers "not this SHAPE of file, wherever
+ * it is". Only the second survives someone moving a directory.
+ *
+ * The motivating measurement: across one share, credential-bearing files were
+ * found in `.aws/`, in two separate `git/` trees, in a `docker/` directory, at
+ * a home root, and seven levels down a tool's plugin cache. Three successive
+ * attempts to enumerate the paths each missed some. `**' + '/.env` does not
+ * depend on knowing the layout.
+ *
+ * Blank entries are dropped and duplicates collapsed. Nothing else is
+ * rewritten: rclone's filter syntax is the contract, and silently "fixing" a
+ * pattern would make the flag mean something the operator did not write.
+ */
+export function normalizePatterns(patterns: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const raw of patterns) {
+    const p = raw.trim();
+    if (p.length === 0) continue;
+    if (!out.includes(p)) out.push(p);
+  }
+  return out;
 }
 
 /**
@@ -1418,6 +1450,19 @@ const GlobalArgsSchema = z.object({
       "source: Deep Archive objects cannot be deleted without " +
       "s3:DeleteObject.",
   ),
+  excludePatterns: z.array(z.string()).optional().describe(
+    "rclone filter patterns omitted from the archive, passed verbatim and " +
+      "UNANCHORED, e.g. ['**/.env', '**/.npmrc', '**/*.btskey']. Where " +
+      "excludePaths says 'not that tree', this says 'not this shape of " +
+      "file, wherever it is' — the only form that survives someone moving a " +
+      "directory, and the right tool for credential-bearing files, which do " +
+      "not confine themselves to one place. Applied at every rung that " +
+      "counts or moves bytes. REFUSED with strategy pack: the pack path " +
+      "streams through busybox tar, whose --exclude does not share rclone's " +
+      "filter semantics, so honouring these patterns there cannot be " +
+      "guaranteed — and a pattern silently not applied to a tar would " +
+      "archive the very files it names.",
+  ),
   churnWarnFraction: z.number().optional().describe(
     "Churn above this fraction between scans raises churnWarning. Default " +
       "0.05. Deep Archive bills a 180-day minimum on every replaced object.",
@@ -1903,7 +1948,7 @@ async function pushPacked(
 
 export const model = {
   type: "@sntxrr/rclone/archive",
-  version: "2026.09.01.1",
+  version: "2026.09.01.2",
   globalArguments: GlobalArgsSchema,
 
   // No-op: this release changes what gets EXCLUDED and how a pack is sized and
@@ -1982,6 +2027,23 @@ export const model = {
         "destination against an unfiltered source and go permanently red. " +
         "Existing instances are unaffected: unset means the previous " +
         "behaviour exactly.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.09.01.2",
+      description:
+        "Adds the optional excludePatterns global: rclone filter patterns " +
+        "passed verbatim and UNANCHORED, for omitting a SHAPE of file " +
+        "wherever it sits. excludePaths, added in the previous release, " +
+        "turned out to be the wrong tool for credential-bearing files: " +
+        "across one share they were found in .aws/, in two separate git " +
+        "trees, in a docker directory, at a home root, and deep inside a " +
+        "tool's plugin cache, and three successive attempts to enumerate " +
+        "the paths each missed some. Refused with strategy pack, including " +
+        "when auto lands on pack, because busybox tar cannot honour rclone " +
+        "filter syntax and a silently unapplied pattern would archive the " +
+        "very files it names while every count still reconciled. No " +
+        "globalArguments removed; unset means the previous behaviour.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -2156,7 +2218,12 @@ export const model = {
           NO_CREDENTIALS,
           destinationOf(g),
           transportOf(g),
-          ["size", "/data", "--json", ...excludeFlags(g.excludePaths ?? [])],
+          [
+            "size",
+            "/data",
+            "--json",
+            ...excludeFlags(g.excludePaths ?? [], g.excludePatterns ?? []),
+          ],
         );
 
         const parsed = run.code === RCLONE_EXIT.OK
@@ -2293,6 +2360,46 @@ export const model = {
         const pinned = args.strategy ??
           (g.strategy && g.strategy !== "auto" ? g.strategy : undefined);
 
+        // Refuse rather than archive the files the operator asked to omit.
+        // The pack path streams through busybox tar, whose --exclude matches
+        // on its own terms and does not implement rclone's filter syntax, so
+        // a pattern like `**' + '/.env` cannot be honoured there. Applying it to
+        // the rclone rungs but not to the tar would put the named files in
+        // the archive while every count still reconciled -- verify measures
+        // the pack object, not its members.
+        if (
+          normalizePatterns(g.excludePatterns ?? []).length > 0 &&
+          pinned === "pack"
+        ) {
+          const handle = await context.writeResource(
+            "transfer",
+            `${share}-transfer`,
+            {
+              shareName: share,
+              destination: dest,
+              strategy: "pack",
+              dryRun,
+              passed: false,
+              inconclusive: false,
+              nothingToTransfer: false,
+              failureReason: "pattern-exclude-unsupported-with-pack",
+              detail:
+                "excludePatterns cannot be honoured by the pack path's tar. " +
+                "Use excludePaths, or strategy direct.",
+              exitCode: RCLONE_EXIT.OK,
+              storageClass: g.storageClass ?? DEFAULT_STORAGE_CLASS,
+              packsPlanned: 0,
+              packsUploaded: 0,
+              packsSkipped: 0,
+              packsFailed: 0,
+              failedPacks: [],
+              ranAt: new Date().toISOString(),
+              durationMs: Date.now() - started,
+            },
+          );
+          return { dataHandles: [handle] };
+        }
+
         let strategy: "direct" | "pack";
         if (pinned) {
           strategy = pinned;
@@ -2301,7 +2408,12 @@ export const model = {
             NO_CREDENTIALS,
             destinationOf(g),
             transportOf(g),
-            ["size", "/data", "--json", ...excludeFlags(g.excludePaths ?? [])],
+            [
+              "size",
+              "/data",
+              "--json",
+              ...excludeFlags(g.excludePaths ?? [], g.excludePatterns ?? []),
+            ],
           );
           const measured = sizeRun.code === RCLONE_EXIT.OK
             ? parseSize(sizeRun.stdout)
@@ -2361,6 +2473,44 @@ export const model = {
           );
         }
 
+        // The same refusal as above, for the path where `auto` LANDED on pack
+        // rather than it being pinned. Checking only the pinned case would
+        // leave the patterns silently dropped whenever the share's shape
+        // happened to choose pack -- the worst version, because it depends on
+        // the data and so changes underneath you.
+        if (
+          strategy === "pack" &&
+          normalizePatterns(g.excludePatterns ?? []).length > 0
+        ) {
+          const handle = await context.writeResource(
+            "transfer",
+            `${share}-transfer`,
+            {
+              shareName: share,
+              destination: dest,
+              strategy: "pack",
+              dryRun,
+              passed: false,
+              inconclusive: false,
+              nothingToTransfer: false,
+              failureReason: "pattern-exclude-unsupported-with-pack",
+              detail:
+                "auto chose pack, but excludePatterns cannot be honoured by " +
+                "its tar. Pin strategy direct, or use excludePaths.",
+              exitCode: RCLONE_EXIT.OK,
+              storageClass: g.storageClass ?? DEFAULT_STORAGE_CLASS,
+              packsPlanned: 0,
+              packsUploaded: 0,
+              packsSkipped: 0,
+              packsFailed: 0,
+              failedPacks: [],
+              ranAt: new Date().toISOString(),
+              durationMs: Date.now() - started,
+            },
+          );
+          return { dataHandles: [handle] };
+        }
+
         if (strategy === "pack") {
           return await pushPacked(args, context, started);
         }
@@ -2410,7 +2560,7 @@ export const model = {
           "/data",
           dest,
           ...flags,
-          ...excludeFlags(g.excludePaths ?? []),
+          ...excludeFlags(g.excludePaths ?? [], g.excludePatterns ?? []),
         ];
 
         // Strip ONLY --dry-run, and by filtering the real argv rather than by
@@ -2496,7 +2646,12 @@ export const model = {
           NO_CREDENTIALS,
           destinationOf(g),
           transportOf(g),
-          ["size", "/data", "--json", ...excludeFlags(g.excludePaths ?? [])],
+          [
+            "size",
+            "/data",
+            "--json",
+            ...excludeFlags(g.excludePaths ?? [], g.excludePatterns ?? []),
+          ],
         );
         const destRun = await runRclone(
           credentialsOf(g),

@@ -30,6 +30,7 @@ import {
   NEVER_ARCHIVE,
   normalisePrefix,
   normalizeExcludePaths,
+  normalizePatterns,
   OBJECT_OVERHEAD_BYTES,
   PACK_PART_BUDGET,
   parseDu,
@@ -2133,4 +2134,108 @@ Deno.test("push and verify apply the SAME exclude set", () => {
   const paths = ["git", "scratch"];
   assertEquals(excludeFlags(paths), excludeFlags(paths));
   assertEquals(excludeFlags(paths).filter((f) => f !== "--exclude").length, 6);
+});
+
+Deno.test("a pattern exclude is UNANCHORED, so layout cannot defeat it", () => {
+  const flags = excludeFlags([], ["**/.env"]);
+  // Passed through verbatim, with no leading slash: the point is to match at
+  // any depth, which is the opposite of what excludePaths does.
+  assertEquals(flags.slice(4), ["--exclude", "**/.env"]);
+  assertEquals(flags.includes("/**/.env"), false);
+});
+
+Deno.test("paths and patterns compose, and neither disturbs NEVER_ARCHIVE", () => {
+  const flags = excludeFlags(["git"], ["**/.env", "**/*.btskey"]);
+  assertEquals(flags.slice(0, 4), [
+    "--exclude",
+    "#recycle/**",
+    "--exclude",
+    "@eaDir/**",
+  ]);
+  assertEquals(flags.slice(4, 8), [
+    "--exclude",
+    "/git/**",
+    "--exclude",
+    "/git",
+  ]);
+  assertEquals(flags.slice(8), [
+    "--exclude",
+    "**/.env",
+    "--exclude",
+    "**/*.btskey",
+  ]);
+});
+
+Deno.test("pattern normalisation drops blanks and dupes, rewrites nothing else", () => {
+  assertEquals(normalizePatterns(["**/.env", "**/.env"]), ["**/.env"]);
+  assertEquals(normalizePatterns(["", "   "]), []);
+  // rclone's filter syntax is the contract. Silently "fixing" a pattern would
+  // make the flag mean something the operator did not write, so a leading
+  // slash is preserved rather than stripped the way excludePaths strips it.
+  assertEquals(normalizePatterns(["/x/*.pem"]), ["/x/*.pem"]);
+  assertEquals(normalizePatterns([]), []);
+});
+
+Deno.test("excludeFlags with no arguments is unchanged from before both features", () => {
+  // The compatibility guarantee: an existing model that sets neither global
+  // gets exactly the filters it always got.
+  assertEquals(excludeFlags(), [
+    "--exclude",
+    "#recycle/**",
+    "--exclude",
+    "@eaDir/**",
+  ]);
+  assertEquals(excludeFlags([], []), excludeFlags());
+});
+
+Deno.test("excludePatterns with pinned pack REFUSES rather than archiving the named files", async () => {
+  // busybox tar cannot honour rclone filter syntax. Applying the pattern to
+  // the rclone rungs but not to the tar would put the named files -- .env,
+  // credentials -- into the archive while every count still reconciled,
+  // because verify measures the pack object and not its members. On Deep
+  // Archive that is unretractable without s3:DeleteObject.
+  const ssh = await countingSsh("exit 0");
+  const { written, context } = testContext({
+    ...baseArgs(ssh.path),
+    strategy: "pack",
+    excludePatterns: ["**/.env"],
+  });
+  try {
+    await model.methods.push.execute({}, context);
+    assertEquals(written.length, 1);
+    const d = written[0].data as Record<string, unknown>;
+    assertEquals(d.passed, false);
+    assertStringIncludes(
+      String(d.failureReason),
+      "pattern-exclude-unsupported-with-pack",
+    );
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("the same refusal fires when AUTO lands on pack", async () => {
+  // Checking only the pinned case would leave the patterns silently dropped
+  // whenever the share's shape happened to choose pack -- the worst version,
+  // because it depends on the data and so changes underneath you.
+  // 4 files totalling 4 KiB: mean 1 KiB, far below the 1 MiB threshold, so
+  // auto picks pack.
+  const ssh = await countingSsh(
+    `echo '{"count":4,"bytes":4096}'`,
+  );
+  const { written, context } = testContext({
+    ...baseArgs(ssh.path),
+    excludePatterns: ["**/.env"],
+  });
+  try {
+    await model.methods.push.execute({}, context);
+    const d = written[written.length - 1].data as Record<string, unknown>;
+    assertEquals(d.passed, false);
+    assertStringIncludes(
+      String(d.failureReason),
+      "pattern-exclude-unsupported-with-pack",
+    );
+  } finally {
+    ssh.cleanup();
+  }
 });
