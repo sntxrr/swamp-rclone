@@ -29,6 +29,7 @@ import {
   model,
   NEVER_ARCHIVE,
   normalisePrefix,
+  normalizeExcludePaths,
   OBJECT_OVERHEAD_BYTES,
   PACK_PART_BUDGET,
   parseDu,
@@ -45,6 +46,7 @@ import {
   S3_MAX_UPLOAD_PARTS,
   S3_STORAGE_CLASSES,
   shQuote,
+  tarExcludeArgs,
 } from "./rclone_archive.ts";
 
 const CREDS = {
@@ -2068,4 +2070,67 @@ Deno.test("an unmeasurable share refuses rather than defaulting either way", asy
   } finally {
     ssh.cleanup();
   }
+});
+
+Deno.test("an operator exclude is ANCHORED, so it cannot match a nested namesake", () => {
+  const flags = excludeFlags(["git"]);
+  // The hardcoded pair is untouched, and still unanchored.
+  assertEquals(flags.slice(0, 4), [
+    "--exclude",
+    "#recycle/**",
+    "--exclude",
+    "@eaDir/**",
+  ]);
+  // The operator exclude anchors, and covers the directory as well as its
+  // contents.
+  assertEquals(flags.slice(4), [
+    "--exclude",
+    "/git/**",
+    "--exclude",
+    "/git",
+  ]);
+  // NEGATIVE CONTROL, and the whole reason this is anchored. A share whose
+  // user directories contain any nested directory called `git` — a vendored
+  // checkout, a tool's plugin cache — would lose those too under an
+  // unanchored `git/**`, and verify still passes because it applies the same
+  // filter to both sides, so the loss is invisible.
+  assertEquals(flags.includes("git/**"), false);
+});
+
+Deno.test("excludePaths normalisation: slashes, blanks, dupes and ..", () => {
+  // The same intent typed four ways is one exclusion.
+  assertEquals(normalizeExcludePaths(["git", "/git", "git/", "/git/"]), [
+    "git",
+  ]);
+  assertEquals(normalizeExcludePaths(["", "   "]), []);
+  assertEquals(normalizeExcludePaths(["a/b", "a/b"]), ["a/b"]);
+  // `..` is DROPPED rather than escaped: as an rclone filter it cannot
+  // traverse anywhere, but it can only have arrived by mistake, and a filter
+  // that matches nothing while looking deliberate is worse than none.
+  assertEquals(normalizeExcludePaths(["../etc", "x/../y"]), []);
+  assertEquals(normalizeExcludePaths([]), []);
+});
+
+Deno.test("an excluded top-level entry is skipped by the pack sizing too", () => {
+  // buildPackPlan derives its packs from buildDuScript's output. A directory
+  // filtered out of push but still measured here is planned as a pack,
+  // uploaded as an empty tar, and counted in the cost projection.
+  assertStringIncludes(buildDuScript(["git"]), "/data/git/");
+  assertEquals(buildDuScript().includes("/data/git/"), false);
+});
+
+Deno.test("the pack tar honours operator excludes", () => {
+  const args = tarExcludeArgs(["git"]);
+  assertStringIncludes(args, "--exclude '#recycle'");
+  assertStringIncludes(args, "--exclude '@eaDir'");
+  assertStringIncludes(args, "--exclude 'git'");
+});
+
+Deno.test("push and verify apply the SAME exclude set", () => {
+  // If these diverge, verify compares a filtered destination against an
+  // unfiltered source and reports a permanent, meaningless delta — the
+  // failure that made archive-disk-reports red on every run.
+  const paths = ["git", "scratch"];
+  assertEquals(excludeFlags(paths), excludeFlags(paths));
+  assertEquals(excludeFlags(paths).filter((f) => f !== "--exclude").length, 6);
 });

@@ -147,9 +147,45 @@ export const NEVER_ARCHIVE = ["#recycle", "@eaDir"];
  * For `#recycle` that is still defence — DSM only creates one at a share root.
  * For `@eaDir` it is the whole point: DSM puts one beside every directory it
  * has indexed, so an anchored filter would match none of them.
+ *
+ * Operator excludes from `excludePaths` are the OPPOSITE — ANCHORED, with a
+ * leading slash. They name one path in one share, so an unanchored exclude of
+ * `git` would also drop every nested directory of that name — a vendored
+ * checkout, a tool's cache — silently omitting unrelated data while `verify`
+ * still passed, because verify applies the same filter to both sides.
  */
-export function excludeFlags(): string[] {
-  return NEVER_ARCHIVE.flatMap((name) => ["--exclude", `${name}/**`]);
+export function excludeFlags(extra: readonly string[] = []): string[] {
+  return [
+    ...NEVER_ARCHIVE.flatMap((name) => ["--exclude", `${name}/**`]),
+    ...normalizeExcludePaths(extra).flatMap((
+      p,
+    ) => ["--exclude", `/${p}/**`, "--exclude", `/${p}`]),
+  ];
+}
+
+/**
+ * Normalise operator-supplied excludes into share-relative path fragments.
+ *
+ * Leading and trailing slashes are stripped so `git`, `/git` and `git/` are the
+ * same exclusion, because they read as the same intent and a filter that
+ * silently depends on which one was typed is a trap.
+ *
+ * A fragment containing `..` is DROPPED, not escaped. These become rclone
+ * filters, not filesystem paths, so `..` cannot traverse anywhere — but it can
+ * only have arrived by mistake, and a filter that matches nothing while looking
+ * deliberate is worse than one that is absent.
+ */
+export function normalizeExcludePaths(
+  paths: readonly string[],
+): string[] {
+  const out: string[] = [];
+  for (const raw of paths) {
+    const p = raw.trim().replace(/^\/+/, "").replace(/\/+$/, "");
+    if (p.length === 0) continue;
+    if (p.split("/").includes("..")) continue;
+    if (!out.includes(p)) out.push(p);
+  }
+  return out;
 }
 
 /**
@@ -159,8 +195,11 @@ export function excludeFlags(): string[] {
  * the generated command — which an operator copies by hand to run the seed
  * (SETUP.md §7.3) — read like a mistake.
  */
-export function tarExcludeArgs(): string {
-  return NEVER_ARCHIVE.map((name) => `--exclude ${shQuote(name)}`).join(" ");
+export function tarExcludeArgs(extra: readonly string[] = []): string {
+  return [
+    ...NEVER_ARCHIVE,
+    ...normalizeExcludePaths(extra),
+  ].map((name) => `--exclude ${shQuote(name)}`).join(" ");
 }
 
 /** Subcommands that remove data. This suite never deletes. */
@@ -844,12 +883,22 @@ export function parseDu(
  * would have them silently dropped from the archive. The ceiling is what makes
  * "there are loose files" and "looseFileBytes > 0" the same statement.
  */
-export function buildDuScript(): string {
+export function buildDuScript(
+  excludePaths: readonly string[] = [],
+): string {
   const names = NEVER_ARCHIVE.map((n) => `-name ${shQuote(n)}`).join(" -o ");
+  // Skip an excluded top-level entry HERE as well as in the rclone filters.
+  // buildPackPlan derives its packs from this script's output, so a directory
+  // filtered out of push but still measured here would be planned as a pack,
+  // uploaded as an empty tar, and counted in the cost projection.
+  const skips = normalizeExcludePaths(excludePaths)
+    .filter((p) => !p.includes("/"))
+    .map((p) => `  [ "$d" = ${shQuote(`/data/${p}/`)} ] && continue`);
   return [
     "set -e",
     "for d in /data/*/; do",
     '  [ -d "$d" ] || continue',
+    ...skips,
     "  t=$(du -skb \"$d\" 2>/dev/null | awk '{print $1; exit}')",
     `  e=$(find "$d" \\( ${names} \\) -type d -prune -print0 2>/dev/null ` +
     "| xargs -0 -r du -skb 2>/dev/null | awk '{s+=$1} END {print s+0}')",
@@ -1064,10 +1113,13 @@ export function buildPackScript(
   destination: string,
   storageClass: string,
   upload: Extract<PackUploadPlan, { streamable: true }>,
+  excludePaths: readonly string[] = [],
 ): string {
   const tar = member === ROOT_PACK_MEMBER
-    ? `cd /data && find . -maxdepth 1 -type f | tar ${tarExcludeArgs()} -T - -cf -`
-    : `tar -C /data ${tarExcludeArgs()} -cf - ${shQuote(member)}`;
+    ? `cd /data && find . -maxdepth 1 -type f | tar ${
+      tarExcludeArgs(excludePaths)
+    } -T - -cf -`
+    : `tar -C /data ${tarExcludeArgs(excludePaths)} -cf - ${shQuote(member)}`;
   return [
     "set -e",
     "set -o pipefail",
@@ -1352,6 +1404,19 @@ const GlobalArgsSchema = z.object({
   minAgeMinutes: z.number().optional().describe(
     "Skip files modified more recently than this. Default 15 — the NAS is " +
       "live and Plex, ABB and Time Machine all write during a run.",
+  ),
+  excludePaths: z.array(z.string()).optional().describe(
+    "Share-relative paths to omit entirely, e.g. ['git']. ANCHORED at the " +
+      "share root, so 'git' excludes <share>/git and not every nested " +
+      "directory called git. Applied identically at every rung that counts " +
+      "or moves bytes — scan, push, verify and the pack sizing — because an " +
+      "exclude on push but not on verify makes verify compare a filtered " +
+      "destination against an unfiltered source and report a permanent, " +
+      "meaningless delta. Use it for trees that must never leave the NAS " +
+      "(working copies holding live .env secrets) or that are reproducible " +
+      "elsewhere. It is NOT a substitute for removing credentials from the " +
+      "source: Deep Archive objects cannot be deleted without " +
+      "s3:DeleteObject.",
   ),
   churnWarnFraction: z.number().optional().describe(
     "Churn above this fraction between scans raises churnWarning. Default " +
@@ -1662,7 +1727,7 @@ async function pushPacked(
     NO_CREDENTIALS,
     destination,
     { ...transport, entrypoint: "sh" },
-    ["-c", buildDuScript()],
+    ["-c", buildDuScript(g.excludePaths ?? [])],
   );
 
   const entries = parseDu(duRun.stdout);
@@ -1759,7 +1824,16 @@ async function pushPacked(
         creds,
         destination,
         { ...transport, entrypoint: "sh" },
-        ["-c", buildPackScript(pack.member, object, storageClass, upload)],
+        [
+          "-c",
+          buildPackScript(
+            pack.member,
+            object,
+            storageClass,
+            upload,
+            g.excludePaths ?? [],
+          ),
+        ],
       );
       uploaded++;
       continue;
@@ -1769,7 +1843,16 @@ async function pushPacked(
       creds,
       destination,
       { ...transport, entrypoint: "sh" },
-      ["-c", buildPackScript(pack.member, object, storageClass, upload)],
+      [
+        "-c",
+        buildPackScript(
+          pack.member,
+          object,
+          storageClass,
+          upload,
+          g.excludePaths ?? [],
+        ),
+      ],
     );
 
     if (run.code === RCLONE_EXIT.OK) {
@@ -1820,7 +1903,7 @@ async function pushPacked(
 
 export const model = {
   type: "@sntxrr/rclone/archive",
-  version: "2026.08.29.1",
+  version: "2026.09.01.1",
   globalArguments: GlobalArgsSchema,
 
   // No-op: this release changes what gets EXCLUDED and how a pack is sized and
@@ -1886,6 +1969,19 @@ export const model = {
         "for 1024x the planned buffer: a 5 MiB chunk went out as 5242880, " +
         "which rclone read as 5 GiB. That is what made `pack` OOM the NAS " +
         "and look unusable. No globalArguments changes.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.09.01.1",
+      description:
+        "Adds the optional excludePaths global: share-relative paths omitted " +
+        "entirely, ANCHORED at the share root so 'git' cannot also match a " +
+        "nested directory of that name. Applied at every rung that counts or " +
+        "moves bytes -- scan, push, verify, the pack tar and the du sizing -- " +
+        "because excluding on push alone makes verify compare a filtered " +
+        "destination against an unfiltered source and go permanently red. " +
+        "Existing instances are unaffected: unset means the previous " +
+        "behaviour exactly.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -2060,7 +2156,7 @@ export const model = {
           NO_CREDENTIALS,
           destinationOf(g),
           transportOf(g),
-          ["size", "/data", "--json", ...excludeFlags()],
+          ["size", "/data", "--json", ...excludeFlags(g.excludePaths ?? [])],
         );
 
         const parsed = run.code === RCLONE_EXIT.OK
@@ -2205,7 +2301,7 @@ export const model = {
             NO_CREDENTIALS,
             destinationOf(g),
             transportOf(g),
-            ["size", "/data", "--json", ...excludeFlags()],
+            ["size", "/data", "--json", ...excludeFlags(g.excludePaths ?? [])],
           );
           const measured = sizeRun.code === RCLONE_EXIT.OK
             ? parseSize(sizeRun.stdout)
@@ -2309,7 +2405,13 @@ export const model = {
 
         // `copy`, never `sync`. The runner refuses `sync` outright; naming it
         // here as well makes the intent legible at the call site.
-        const rcloneArgs = ["copy", "/data", dest, ...flags, ...excludeFlags()];
+        const rcloneArgs = [
+          "copy",
+          "/data",
+          dest,
+          ...flags,
+          ...excludeFlags(g.excludePaths ?? []),
+        ];
 
         // Strip ONLY --dry-run, and by filtering the real argv rather than by
         // rebuilding it. Any other divergence between what is printed and what
@@ -2394,7 +2496,7 @@ export const model = {
           NO_CREDENTIALS,
           destinationOf(g),
           transportOf(g),
-          ["size", "/data", "--json", ...excludeFlags()],
+          ["size", "/data", "--json", ...excludeFlags(g.excludePaths ?? [])],
         );
         const destRun = await runRclone(
           credentialsOf(g),
