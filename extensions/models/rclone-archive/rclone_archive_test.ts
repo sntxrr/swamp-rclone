@@ -248,6 +248,33 @@ for (
   });
 }
 
+// A run cut off by its own deadline must SAY so. Deno kills the child when the
+// AbortSignal fires and child.output() resolves rather than throwing, so before
+// this was fixed the deadline surfaced as ssh's exit code, 255 -- which reads as
+// a dropped connection and sends you diagnosing the network instead of the
+// timeout. Observed on a real multi-terabyte copy: it ran for exactly the
+// timeout and still reported exit-255.
+Deno.test("runRclone reports a deadline as a timeout, not ssh's exit code", async () => {
+  const ssh = await fakeSsh("sleep 5");
+  try {
+    const r = await runRclone(CREDS, DEST, {
+      sshHost: "nas.example.invalid",
+      sshBinary: ssh.path,
+      sourceMount: "/volume1/example",
+      timeoutMs: 250,
+    }, ["copy", "/data", "dest:bucket/x"]);
+    assert(r.timedOut, "timedOut must be set when the deadline fires");
+    assertEquals(r.code, RCLONE_EXIT.DURATION_LIMIT);
+    assert(
+      r.code !== 255,
+      "255 is ssh's code and misreads as a dropped connection",
+    );
+    assertStringIncludes(r.stderr, "timed out after 250ms");
+  } finally {
+    ssh.cleanup();
+  }
+});
+
 Deno.test("runRclone permits copy", async () => {
   const ssh = await fakeSsh("exit 0");
   try {
