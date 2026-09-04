@@ -1448,6 +1448,14 @@ const GlobalArgsSchema = z.object({
       "six months of storage per replaced byte. With it off, modified files " +
       "are never updated and are reported as errors.",
   ),
+  skipLinks: z.boolean().optional().describe(
+    "Pass --skip-links, suppressing the NOTICE rclone logs for every symlink " +
+      "it declines to follow. Off by default. Turn it on for a source that " +
+      "contains a captured filesystem image or similar: such a tree can emit " +
+      "hundreds of these per run, and because the captured log is truncated " +
+      "they can crowd out the ERROR lines that explain a failure. It changes " +
+      "logging only -- symlinks are skipped either way without --copy-links.",
+  ),
   minAgeMinutes: z.number().optional().describe(
     "Skip files modified more recently than this. Default 15 — the NAS is " +
       "live and Plex, ABB and Time Machine all write during a run.",
@@ -1542,6 +1550,9 @@ const PushArgsSchema = z.object({
   ),
   allowOverwrite: z.boolean().optional().describe(
     "Permit re-archiving modified files for this run only.",
+  ),
+  skipLinks: z.boolean().optional().describe(
+    "Suppress the per-symlink NOTICE lines for this run only.",
   ),
   repack: z.boolean().optional().describe(
     "Pack strategy only. Replace packs whose object already exists. Off by " +
@@ -2548,6 +2559,13 @@ export const model = {
         // means a MODIFIED file is never archived and reports as an error.
         // Opting out is a cost decision, so it is explicit.
         if (!overwrite) flags.push("--immutable");
+
+        // Symlink NOTICEs are logged one per link and are never actionable:
+        // without --copy-links the link is skipped regardless. On a source
+        // holding a captured filesystem image they can outnumber real errors
+        // by two orders of magnitude, and since the captured detail is
+        // truncated, the errors are what gets dropped.
+        if (args.skipLinks ?? g.skipLinks ?? false) flags.push("--skip-links");
 
         // --no-traverse and --max-age are coupled deliberately, because
         // --no-traverse alone is a cost trap.
