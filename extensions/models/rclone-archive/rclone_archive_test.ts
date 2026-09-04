@@ -1181,6 +1181,43 @@ Deno.test("the window can be set on the model, not just per run", async () => {
   }
 });
 
+// Symlink NOTICEs are one line per link and never actionable -- the link is
+// skipped either way without --copy-links. On a source holding a captured
+// filesystem image they can outnumber real errors by two orders of magnitude,
+// and because the captured detail is truncated it is the ERROR lines that get
+// dropped. Off by default so logging does not change under anyone silently.
+Deno.test("--skip-links is off by default and opt-in per run or globally", async () => {
+  const ssh = await fakeSsh("exit 0");
+  const { context } = testContext(
+    baseArgs(ssh.path, { strategy: "direct" }),
+  );
+  try {
+    await model.methods.push.execute({}, context);
+    assert(
+      !(ssh.argv().at(-1) ?? "").includes("--skip-links"),
+      "default must not change logging",
+    );
+
+    await model.methods.push.execute({ skipLinks: true }, context);
+    assertStringIncludes(ssh.argv().at(-1) ?? "", "--skip-links");
+  } finally {
+    ssh.cleanup();
+  }
+});
+
+Deno.test("skipLinks set globally applies without a per-run argument", async () => {
+  const ssh = await fakeSsh("exit 0");
+  const { context } = testContext(
+    baseArgs(ssh.path, { strategy: "direct", skipLinks: true }),
+  );
+  try {
+    await model.methods.push.execute({}, context);
+    assertStringIncludes(ssh.argv().at(-1) ?? "", "--skip-links");
+  } finally {
+    ssh.cleanup();
+  }
+});
+
 Deno.test("--immutable is on by default and removable only deliberately", async () => {
   const ssh = await fakeSsh("exit 0");
   const { context } = testContext(
