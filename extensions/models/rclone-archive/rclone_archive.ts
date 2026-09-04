@@ -644,6 +644,21 @@ export async function runRclone(
 
     const output = await child.output();
     const decoder = new TextDecoder();
+    // Deno kills the child when the signal aborts, and child.output() RESOLVES
+    // rather than rejecting -- so the catch below never sees a timeout. Without
+    // this check the deadline is reported as whatever exit code ssh died with,
+    // which is 255, and 255 reads as a dropped connection rather than a run
+    // that was cut off. The duration matching timeoutMs exactly is the only
+    // other tell, and it is easy to miss.
+    if (controller.signal.aborted) {
+      return {
+        code: RCLONE_EXIT.DURATION_LIMIT,
+        stdout: decoder.decode(output.stdout),
+        stderr: `rclone timed out after ${timeoutMs}ms`,
+        durationMs: Date.now() - started,
+        timedOut: true,
+      };
+    }
     return {
       code: output.code,
       stdout: decoder.decode(output.stdout),
