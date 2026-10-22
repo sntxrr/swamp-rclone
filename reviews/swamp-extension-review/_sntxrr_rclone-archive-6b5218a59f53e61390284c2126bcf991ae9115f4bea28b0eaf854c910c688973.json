@@ -1,0 +1,82 @@
+{
+  "extension": "@sntxrr/rclone-archive",
+  "version": "2026.10.22.1",
+  "reviewedAt": "2026-10-22T16:29:32Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "Delta review for 2026.10.22.1 (hygiene cards #435/#436). deno-command finding at the ssh spawn re-examined and accepted inline with a reason. Credentials travel as an env file written to the child's stdin (clearEnv, PATH/HOME only); buildRcloneInvocation throws if either credential appears in args; tests drive a fake ssh that records argv and assert the secret is absent from argv. stderr is redacted for both credentials. Also reviewed the 08.29.1-09.01.2 delta that had no report on file: excludePaths/excludePatterns, skipLinks, the timeout fix and the chunk-size unit; exclude values reach the remote shell only through shQuote, and none of it touches credential flow."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "Delta review for 2026.10.22.1 (hygiene cards #435/#436). Carried from the 2026.08.19.5 review; code for this dimension unchanged since (git log), and not re-reviewed in this delta. Unchanged, and adequate for the new failure mode. A pack that cannot be built now fails the pipeline under pipefail and is recorded in failedPacks with the member name, which is what an operator needs to find it. The bug being fixed was not a logging gap -- it was two rungs disagreeing while BOTH logged success -- so the durable remedy is the construction-level agreement below, not another log line. No new log could have caught the old bug, because nothing in the system knew the tar was wrong."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Delta review for 2026.10.22.1 (hygiene cards #435/#436). Carried from the 2026.08.19.5 review; code for this dimension unchanged since (git log), and not re-reviewed in this delta. The one new failure mode is a tar fed an empty list: busybox exits 1 with `tar: empty archive`, and set -o pipefail turns that into a failed pack rather than a zero-byte object. Probed directly in the pinned image against a directory holding only a subdirectory. This is reachable only if a loose file vanishes between the du rung and the push rung, since buildPackPlan emits _root only when looseFileBytes > 0 -- and failing loudly on that race is the correct direction, where the OLD glob would have matched the surviving directories, uploaded a tar of bare directory entries, and recorded success. The fix therefore improves the race, not just the common path."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "Delta review for 2026.10.22.1 (hygiene cards #435/#436). Carried from the 2026.08.19.5 review; code for this dimension unchanged since (git log), and not re-reviewed in this delta. 134 tests, confirmed by exit status, up from 131. Three are new and one is the load-bearing one: 'the _root pack selects the same set buildDuScript measures' asserts the SAME find expression appears in both buildPackScript and buildDuScript. That is deliberately a test of the agreement rather than of either side, because the bug was not in either function -- each was internally reasonable -- it was in their relationship, which no single-function test can see. A second test asserts `./*` is ABSENT rather than asserting the find expression is present, so a future edit that reintroduces a glob fails even if it keeps the find. The third pins the busybox constraint (-T -, no --null, no -print0) so the newline-separated list is not 'tidied' into -print0 by someone assuming GNU tar. Beyond the unit tests the fix was verified against the real share in the pinned production image: .DS_Store present, @eaDir and docker/ absent."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "Delta review for 2026.10.22.1 (hygiene cards #435/#436). Carried from the 2026.08.19.5 review; code for this dimension unchanged since (git log), and not re-reviewed in this delta. Object NAMES remain a function of the share layout, never of the data, so the property that matters on Deep Archive -- that an unchanged subtree is not re-uploaded into a fresh 180-day minimum -- is untouched. One residual, stated rather than left implicit: `find` emits directory order, so the member ORDER inside _root.tar is not deterministic across runs. It has no cost or correctness consequence here, because existing packs are skipped rather than compared, restoreDrill extracts a member BY NAME, and a repack replaces the object wholesale -- but a future change that starts hashing pack bytes to detect drift would break on it, and should sort the list at that point rather than wonder why. A second, quieter improvement: -T - streams the member list, so a share root with very many loose files can no longer overflow argv the way `./*` word-expansion could."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "Delta review for 2026.10.22.1 (hygiene cards #435/#436). Carried from the 2026.08.19.5 review; code for this dimension unchanged since (git log), and not re-reviewed in this delta. No signature, argument, or resource-schema change. buildPackScript keeps its four parameters and returns a script string; the transfer resource keeps every field. Callers are unaffected, which is why the upgrade entry is an identity function."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "Delta review for 2026.10.22.1 (hygiene cards #435/#436). Carried from the 2026.08.19.5 review; code for this dimension unchanged since (git log), and not re-reviewed in this delta. Nothing is staged on the NAS: find writes to a pipe, tar streams to stdout, rcat streams to S3, exactly as before. Peak memory is still the chunk-size times concurrency figure planPackUpload computes, unchanged. If anything the footprint is marginally smaller -- the shell no longer materialises a glob expansion of every top-level entry before exec."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Delta review for 2026.10.22.1 (hygiene cards #435/#436). Carried from the 2026.08.19.5 review; code for this dimension unchanged since (git log), and not re-reviewed in this delta. manifest.yaml and the model's version field agree at 2026.08.19.5. README.md and PRD.md were corrected in the same commit rather than left describing the removed --no-recursion glob -- which matters more than usual here, because the PRD passage was the document that made the glob approach sound deliberate and settled. deno fmt and deno check are clean on both TypeScript files; LICENSE.md and README.md were not reformatted."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Delta review for 2026.10.22.1 (hygiene cards #435/#436). Carried from the 2026.08.19.5 review; code for this dimension unchanged since (git log), and not re-reviewed in this delta. No schema change. Worth recording that `strategy` remains a strict z.enum(['auto','direct','pack']).optional() -- confirmed while auditing the instance that claimed to pin `direct` in a comment but never set the key. The enum is what makes such a pin verifiable once written; the failure there was a missing key in an instance, not a loose schema."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "Delta review for 2026.10.22.1 (hygiene cards #435/#436). Carried from the 2026.08.19.5 review; code for this dimension unchanged since (git log), and not re-reviewed in this delta. Untouched. transfer stays lifetime infinite with garbageCollection 50."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "na",
+      "note": "Delta review for 2026.10.22.1 (hygiene cards #435/#436). Carried from the 2026.08.19.5 review; code for this dimension unchanged since (git log), and not re-reviewed in this delta. Still not a CRUD model. It deliberately cannot delete -- --immutable, no sync, no s3:DeleteObject -- which is the very constraint that makes this bug class expensive: the already-published empty _root.tar cannot be corrected in place, only superseded."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Delta review for 2026.10.22.1 (hygiene cards #435/#436). Carried from the 2026.08.19.5 review; code for this dimension unchanged since (git log), and not re-reviewed in this delta. The shell-entrypoint guard is unchanged and still refuses a credentialed script naming neither --s3-no-check-bucket nor --s3-storage-class; the rendered _root script satisfies it. The stronger preflight added here is not a runtime check at all but a compile-time one -- the sizing rung and the tar rung now share a literal expression, so they cannot drift apart again without a test failing."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Delta review for 2026.10.22.1 (hygiene cards #435/#436). Carried from the 2026.08.19.5 review; code for this dimension unchanged since (git log), and not re-reviewed in this delta. Unchanged; each spec still writes a distinct instance name, covered by an existing test."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Delta review for 2026.10.22.1 (hygiene cards #435/#436). Carried from the 2026.08.19.5 review; code for this dimension unchanged since (git log), and not re-reviewed in this delta. Unchanged. push still cannot read a prior resource -- the ExecuteContext API does not allow it -- which is why the pack is measured in-run rather than read from the last scan, and why the two rungs had to be made to agree by sharing an expression rather than by sharing a value."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "Delta review for 2026.10.22.1 (hygiene cards #435/#436). Model version unchanged; the existing upgrades chain already ends at 2026.09.01.2. Verified: push --dry-run with the manifest bumped reports no versionBumpUpgrade warning."
+    }
+  ]
+}
