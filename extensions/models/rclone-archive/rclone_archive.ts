@@ -617,6 +617,7 @@ export async function runRclone(
   const started = Date.now();
 
   try {
+    // swamp-quality-ignore deno-command: ssh is the transport; credentials go as an env file on stdin, never argv (buildRcloneInvocation refuses one in args; tests assert argv excludes them)
     const command = new Deno.Command(transport.sshBinary ?? "ssh", {
       args: [
         "-o",
